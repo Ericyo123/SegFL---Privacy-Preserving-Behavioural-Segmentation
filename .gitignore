@@ -1,0 +1,15 @@
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# macOS system files
+.DS_Store
+
+# Large report / docx files
+w1952812_yahya_20220610_repair.docx
+report_extracted_text.txt
+
+# Large CSV data files
+backend/data/
+*.csv
