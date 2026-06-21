@@ -68,9 +68,21 @@ class FederatedKMeans:
         self.rs = np.random.RandomState(random_state)
         self.global_centroids = None
 
-    def fit_predict_federated(self, tenant_latent_list):
+    def fit_predict_federated(self, tenant_latent_list, sigma=0.0):
         if not tenant_latent_list or len(tenant_latent_list[0]) == 0:
             return [np.zeros(len(lt)) for lt in tenant_latent_list]
+        
+        # Bounding input sensitivity by clipping latents to unit norm under DP
+        if sigma > 0.0:
+            clipped_list = []
+            for latents in tenant_latent_list:
+                if len(latents) == 0:
+                    clipped_list.append(latents)
+                    continue
+                norms = np.linalg.norm(latents, axis=1, keepdims=True)
+                clipped = latents / np.maximum(1.0, norms)
+                clipped_list.append(clipped)
+            tenant_latent_list = clipped_list
         
         n_samples = len(tenant_latent_list[0])
         if n_samples < self.k:
@@ -100,6 +112,15 @@ class FederatedKMeans:
 
             global_sum = np.sum(tenant_sums, axis=0)
             global_count = np.sum(tenant_counts, axis=0)
+            
+            if sigma > 0.0:
+                # Bounded sensitivity with clip threshold 1.0 (count sensitivity 1, sum sensitivity 1.0)
+                scale_count = sigma
+                scale_sum = sigma * 1.0
+                global_count += self.rs.laplace(0.0, scale_count, size=global_count.shape)
+                global_count = np.clip(global_count, 1e-5, None)
+                global_sum += self.rs.laplace(0.0, scale_sum, size=global_sum.shape)
+                
             new_centroids = self.global_centroids.copy()
             for i in range(self.k):
                 if global_count[i] > 0: 
@@ -108,6 +129,8 @@ class FederatedKMeans:
                     # Dead Cluster Revival: reinitialize to a random data point
                     fallback_idx = self.rs.choice(len(tenant_latent_list[0]))
                     new_centroids[i] = tenant_latent_list[0][fallback_idx].copy()
+                    if sigma > 0.0:
+                        new_centroids[i] += self.rs.laplace(0.0, sigma, size=new_centroids[i].shape)
             
             if np.allclose(self.global_centroids, new_centroids, atol=1e-4): 
                 break
@@ -240,10 +263,22 @@ class FederatedGMM:
         self.covariances = None
         self.weights = None
 
-    def fit_predict_federated(self, tenant_latent_list):
+    def fit_predict_federated(self, tenant_latent_list, sigma=0.0):
         if not tenant_latent_list or len(tenant_latent_list[0]) == 0:
             return [np.zeros(len(lt)) for lt in tenant_latent_list]
         
+        # Bounding input sensitivity by clipping latents to unit norm under DP
+        if sigma > 0.0:
+            clipped_list = []
+            for latents in tenant_latent_list:
+                if len(latents) == 0:
+                    clipped_list.append(latents)
+                    continue
+                norms = np.linalg.norm(latents, axis=1, keepdims=True)
+                clipped = latents / np.maximum(1.0, norms)
+                clipped_list.append(clipped)
+            tenant_latent_list = clipped_list
+
         dim = tenant_latent_list[0].shape[1]
         n_samples = len(tenant_latent_list[0])
         
@@ -301,6 +336,12 @@ class FederatedGMM:
             global_S = np.sum(local_Ss, axis=0)
             global_V = np.sum(local_Vs, axis=0)
             
+            if sigma > 0.0:
+                global_N += self.rs.laplace(0.0, sigma, size=global_N.shape)
+                global_N = np.clip(global_N, 1e-5, None)
+                global_S += self.rs.laplace(0.0, sigma * 1.0, size=global_S.shape)
+                global_V += self.rs.laplace(0.0, sigma * 1.0, size=global_V.shape)
+                
             reg_N = np.clip(global_N, 1e-6, None)
             new_means = global_S / reg_N[:, np.newaxis]
             new_covs = global_V / reg_N[:, np.newaxis]
@@ -348,12 +389,24 @@ class FederatedHDBSCAN:
         self.exemplars = None
         self.exemplar_labels = None
 
-    def fit_predict_federated(self, tenant_latent_list):
+    def fit_predict_federated(self, tenant_latent_list, sigma=0.0):
         from sklearn.cluster import HDBSCAN
         
         if not tenant_latent_list or len(tenant_latent_list[0]) == 0:
             return [np.zeros(len(lt)) for lt in tenant_latent_list]
         
+        # Bounding input sensitivity by clipping latents to unit norm under DP
+        if sigma > 0.0:
+            clipped_list = []
+            for latents in tenant_latent_list:
+                if len(latents) == 0:
+                    clipped_list.append(latents)
+                    continue
+                norms = np.linalg.norm(latents, axis=1, keepdims=True)
+                clipped = latents / np.maximum(1.0, norms)
+                clipped_list.append(clipped)
+            tenant_latent_list = clipped_list
+
         all_exemplars = []
         for latents in tenant_latent_list:
             if len(latents) == 0:
@@ -363,9 +416,15 @@ class FederatedHDBSCAN:
             if k_local > 1:
                 km = KMeans(n_clusters=k_local, random_state=42, n_init='auto')
                 km.fit(latents)
-                all_exemplars.append(km.cluster_centers_)
+                centers = km.cluster_centers_
+                if sigma > 0.0:
+                    centers += self.rs.laplace(0.0, sigma, size=centers.shape)
+                all_exemplars.append(centers)
             elif k_local == 1:
-                all_exemplars.append(latents.mean(axis=0, keepdims=True))
+                mean = latents.mean(axis=0, keepdims=True)
+                if sigma > 0.0:
+                    mean += self.rs.laplace(0.0, sigma, size=mean.shape)
+                all_exemplars.append(mean)
                 
         if not all_exemplars:
             return [np.zeros(len(lt)) for lt in tenant_latent_list]

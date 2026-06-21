@@ -121,6 +121,7 @@ def execute_federated_training(raw_df, params, log_callback=None):
     mode = params.get('mode', 'tal')
     run_seed = params.get('run_seed', None)
     batch_size = 256
+    max_grad_norm = params.get('max_grad_norm', 1.0)
 
     # 1. Data Partitioning
     if log_callback:
@@ -296,8 +297,8 @@ def execute_federated_training(raw_df, params, log_callback=None):
                                 sq_norms += grads.view(original_x.size(0), -1).pow(2).sum(dim=1)
                                 
                         grad_norms = sq_norms.sqrt()
-                        # Clip coefficient: min(1.0, 1.0 / (grad_norms + 1e-6))
-                        clip_coefs = torch.clamp(1.0 / (grad_norms + 1e-6), max=1.0)
+                        # Clip coefficient: min(1.0, max_grad_norm / (grad_norms + 1e-6))
+                        clip_coefs = torch.clamp(max_grad_norm / (grad_norms + 1e-6), max=1.0)
                         
                         # Set grads and add noise
                         opt.zero_grad()
@@ -307,7 +308,7 @@ def execute_federated_training(raw_df, params, log_callback=None):
                             coefs_expanded = clip_coefs.view(-1, *(1,) * dims_to_add)
                             
                             p.grad = ((grads * coefs_expanded).sum(dim=0) / original_x.size(0)).clone()
-                            noise = torch.randn_like(p.grad) * (sigma_val * 1.0) / original_x.size(0)
+                            noise = torch.randn_like(p.grad) * (sigma_val * max_grad_norm) / original_x.size(0)
                             p.grad.add_(noise)
                             
                         if adapters:
@@ -317,7 +318,7 @@ def execute_federated_training(raw_df, params, log_callback=None):
                                 coefs_expanded = clip_coefs.view(-1, *(1,) * dims_to_add)
                                 
                                 p.grad = ((grads * coefs_expanded).sum(dim=0) / original_x.size(0)).clone()
-                                noise = torch.randn_like(p.grad) * (sigma_val * 1.0) / original_x.size(0)
+                                noise = torch.randn_like(p.grad) * (sigma_val * max_grad_norm) / original_x.size(0)
                                 p.grad.add_(noise)
                                 
                         # Average batch loss computation for tracking metrics
@@ -397,7 +398,19 @@ def execute_federated_training(raw_df, params, log_callback=None):
                         p_loc = loc_m.state_dict()[name]
                         diff = (p_glob - p_loc) / (max(1, total_local_steps) * current_lr)
                         new_c_val = c_locals[t_idx][name] - c_global[name] + diff
-                        delta_c_t[name] = new_c_val - c_locals[t_idx][name]
+                        d_c = new_c_val - c_locals[t_idx][name]
+                        
+                        if sigma_val > 0.0:
+                            # Clip control variate updates to bound sensitivity
+                            c_norm = torch.norm(d_c)
+                            clip_coef = min(1.0, max_grad_norm / (c_norm.item() + 1e-6))
+                            d_c = d_c * clip_coef
+                            # Add DP noise to the control variate update
+                            noise = torch.randn_like(d_c) * (sigma_val * max_grad_norm) / len(tr_dls)
+                            d_c.add_(noise)
+                            new_c_val = c_locals[t_idx][name] + d_c
+                            
+                        delta_c_t[name] = d_c
                         new_c_locals_t[name] = new_c_val
                 st_collection_c.append(delta_c_t)
                 new_c_locals.append(new_c_locals_t)
@@ -474,7 +487,7 @@ def execute_federated_training(raw_df, params, log_callback=None):
     else:
         fed_clust = FederatedKMeans(n_clusters=params.get('n_clusters', 5), random_state=run_seed or 42)
         
-    fed_labels = fed_clust.fit_predict_federated(lats)
+    fed_labels = fed_clust.fit_predict_federated(lats, sigma=params.get('sigma', 0.0))
 
     # 6. Metrics Computation
     all_sils, all_dbis, all_chs = [], [], []

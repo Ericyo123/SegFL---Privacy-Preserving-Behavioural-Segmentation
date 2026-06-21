@@ -33,12 +33,17 @@ def compute_cluster_explainability(df, labels, feature_cols=None):
     X = df[feature_cols].fillna(0).values
     y = np.array(labels)
     
+    surrogate_acc = 0.0
     # Check if we have valid classes to classify
     unique_classes = np.unique(y)
     if len(unique_classes) > 1 and len(X) >= len(unique_classes):
-        clf = RandomForestClassifier(n_estimators=50, random_state=42)
+        clf = RandomForestClassifier(n_estimators=50, random_state=42, oob_score=True, bootstrap=True)
         clf.fit(X, y)
         importances = clf.feature_importances_
+        surrogate_acc = float(clf.oob_score_)
+        print(f"📊 Global Surrogate Random Forest OOB Accuracy: {surrogate_acc:.3f}")
+        if surrogate_acc < 0.70:
+            print("⚠️ Warning: Global surrogate model accuracy is low (< 0.70). Cluster feature attributions may not be highly reliable.")
     else:
         importances = np.ones(len(feature_cols)) / len(feature_cols)
         
