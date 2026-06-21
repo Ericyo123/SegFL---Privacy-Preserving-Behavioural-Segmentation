@@ -263,7 +263,8 @@ def generalization_test(raw_df, params, execute_fn, log_callback=None):
     km = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
     labels = km.fit_predict(latents)
     
-    if len(np.unique(labels)) > 1:
+    n_unique = len(np.unique(labels))
+    if 1 < n_unique < len(latents):
         sil = float(silhouette_score(latents, labels))
         dbi = float(davies_bouldin_score(latents, labels))
     else:

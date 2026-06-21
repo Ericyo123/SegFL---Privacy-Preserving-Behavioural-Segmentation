@@ -479,7 +479,8 @@ def execute_federated_training(raw_df, params, log_callback=None):
     # 6. Metrics Computation
     all_sils, all_dbis, all_chs = [], [], []
     for i, lt in enumerate(lats):
-        if len(np.unique(fed_labels[i])) > 1:
+        n_unique_labels = len(np.unique(fed_labels[i]))
+        if 1 < n_unique_labels < len(lt):
             all_sils.append(silhouette_score(lt, fed_labels[i]))
             all_dbis.append(davies_bouldin_score(lt, fed_labels[i]))
             all_chs.append(calinski_harabasz_score(lt, fed_labels[i]))
