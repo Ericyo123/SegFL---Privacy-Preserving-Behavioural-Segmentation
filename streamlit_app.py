@@ -363,6 +363,41 @@ if btn_run:
         st.session_state.stat_test_results = stat_test_results
         st.session_state.scal_results = scal_results
         st.session_state.gen_results = gen_results
+        
+        # ── 7. PDF REPORT GENERATION ──
+        add_log("Generating PDF Evaluation Report...")
+        from backend.ml.report_generator import build_pdf_report
+        import tempfile
+        
+        report_data = {
+            'results': results,
+            'base_df': base_df,
+            'abl_df': abl_df,
+            'dp_df': dp_df,
+            'stability_results': stability_results,
+            'stat_test_results': stat_test_results,
+            'scal_results': scal_results,
+            'gen_results': gen_results
+        }
+        
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = tmp.name
+            
+        try:
+            build_pdf_report(report_data, tmp_path)
+            with open(tmp_path, "rb") as f:
+                pdf_bytes = f.read()
+            st.session_state.pdf_report = pdf_bytes
+            add_log("PDF report compilation complete.")
+        except Exception as e:
+            add_log(f"⚠️ PDF Generation failed: {str(e)}")
+            st.session_state.pdf_report = None
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+                
         st.session_state.is_run = True
 
     else:
@@ -576,7 +611,7 @@ if st.session_state.get('is_run', False):
         st.divider()
         st.markdown("#### Download Research Artifacts")
         
-        dl_col1, dl_col2 = st.columns([1, 2])
+        dl_col1, dl_col2, dl_col3 = st.columns([1.2, 1.8, 1.5])
         
         with dl_col1:
             st.markdown("**Master Profile Table**")
@@ -599,6 +634,19 @@ if st.session_state.get('is_run', False):
                     mime="text/csv",
                     key=f"dl_cluster_{cluster_id}"
                 )
+                
+        with dl_col3:
+            st.markdown("**Evaluation Report**")
+            pdf_bytes = st.session_state.get('pdf_report', None)
+            if pdf_bytes is not None:
+                st.download_button(
+                    label="Download Full PDF Report",
+                    data=pdf_bytes,
+                    file_name="segfl_evaluation_report.pdf",
+                    mime="application/pdf"
+                )
+            else:
+                st.warning("⚠️ PDF Report is not generated. Please re-run.")
     
     # ── TAB 6: Stability & Statistical Tests (conditional) ──
     if stability_results and len(tabs) > 5:
