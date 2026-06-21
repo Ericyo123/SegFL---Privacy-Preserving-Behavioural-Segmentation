@@ -294,8 +294,15 @@ if btn_run:
         # ── 3. DP SWEEP ──
         add_log("Executing Differential Privacy Utility Sweep...")
         dp_results = []
-        for s in [0.0, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0]:
-            add_log(f"Sweeping DP Noise Multiplier (σ) = {s}...")
+        # Center the sweep around the chosen sigma to make it highly relevant and faster
+        if sigma_dp > 0.0:
+            sweep_sigmas = [0.0, float(np.round(sigma_dp * 0.5, 3)), sigma_dp, float(np.round(sigma_dp * 2.0, 3)), 2.0]
+        else:
+            sweep_sigmas = [0.0, 0.1, 0.5, 1.0, 2.0]
+        sweep_sigmas = sorted(list(set([s for s in sweep_sigmas if s >= 0.0])))
+
+        for s in sweep_sigmas:
+            add_log(f"Sweeping DP Noise Multiplier (σ) = {s} (Target chosen σ = {sigma_dp})...")
             res = execute_federated_training(sweep_df, {**base_params, 'sigma': s}, log_callback=None)
             dp_results.append({
                 'DP Sigma (σ)': s,
