@@ -3,6 +3,7 @@ uvicorn
 pandas
 numpy
 scikit-learn
+scipy
 torch
 torchvision
 torchaudio

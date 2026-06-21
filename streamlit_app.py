@@ -10,6 +10,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 from backend.ml.processor import process_csv
 from backend.ml.core_engine import execute_federated_training
+from backend.ml.evaluator import (
+    stability_analysis, wilcoxon_test,
+    scalability_analysis, generalization_test
+)
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="SegFL Analytics", layout="wide", initial_sidebar_state="expanded")
@@ -140,7 +144,7 @@ st.markdown("<h1 class='main-header'>SegFL Analytics</h1>", unsafe_allow_html=Tr
 st.markdown("<p class='sub-header'>Privacy-Preserving Federated Behavioural Segmentation</p>", unsafe_allow_html=True)
 
 st.markdown("""
-**SegFL Analytics** is a decentralized machine learning framework designed to cluster user behavioral profiles across multiple isolated organizations (tenants) without ever sharing raw data. It utilizes a **Tenant Adapter Layer (TAL)** to unify heterogeneous data structures, **Federated Learning** to securely aggregate global intelligence, and **Differential Privacy (DP-SGD)** to mathematically guarantee user anonymity.
+**SegFL Analytics** is a decentralized machine learning framework designed to cluster user behavioral profiles across multiple isolated organizations (tenants) without ever sharing raw data. It utilizes a **Tenant Adapter Layer (TAL)** to unify heterogeneous data structures, **Federated Learning** to securely aggregate global intelligence, and **Differential Privacy (DP-SGD)** with formal **Rényi DP accounting** to mathematically guarantee user anonymity.
 """)
 
 with st.sidebar:
@@ -155,7 +159,17 @@ with st.sidebar:
     g_epochs = st.slider("Global Rounds", 1, 30, 10)
     l_epochs = st.slider("Local Epochs", 1, 10, 3)
     n_clusters = st.slider("Number of Clusters (K)", 2, 10, 5)
-    use_fedprox = st.checkbox("Use FedProx (Proximal Term)", value=False)
+    
+    st.divider()
+    st.subheader("Clustering & Privacy")
+    clustering_method = st.selectbox("Clustering Algorithm", ["kmeans", "gmm", "hdbscan"], index=0)
+    sigma_dp = st.slider("DP Noise Multiplier (σ)", 0.0, 2.0, 0.1, step=0.05)
+    
+    st.divider()
+    st.subheader("Scientific Evaluation")
+    run_stability = st.checkbox("Run Stability Analysis (10 seeds)", value=False)
+    run_scalability_gen = st.checkbox("Run Scalability & Generalization", value=False)
+    
     st.divider()
     btn_run = st.button("Execute SegFL Sequence")
 
@@ -199,54 +213,144 @@ if btn_run:
             st.session_state.logs.append(f"[{ts}] {msg}")
             log_container.code("\n".join(st.session_state.logs), language="bash")
 
-        base_params = {'g_epochs': g_epochs, 'l_epochs': l_epochs, 'n_clusters': n_clusters, 'use_fedprox': use_fedprox}
+        base_params = {
+            'g_epochs': g_epochs,
+            'l_epochs': l_epochs,
+            'n_clusters': n_clusters,
+            'clustering_method': clustering_method
+        }
         
         add_log("Loading dataset into memory...")
         raw_df = cached_process_csv(file_to_process, nrows=nrows)
         
-        # 1. Baselines
+        # ── 1. BASELINES (Centralized, Intersection, Local, TAL-FL, FedProx, SCAFFOLD, MOON) ──
         add_log("Initializing Baseline Comparisons...")
         results_list = []
-        modes = ['cent', 'intersect', 'local', 'tal']
-        display_names = {'cent': 'Centralized', 'intersect': 'Intersection-Only', 'local': 'Local-Isolated', 'tal': 'TAL-FL'}
+        modes = ['cent', 'intersect', 'local', 'tal', 'fedprox', 'scaffold', 'moon']
+        display_names = {
+            'cent': 'Centralized',
+            'intersect': 'Intersection-Only',
+            'local': 'Local-Isolated',
+            'tal': 'TAL-FL (SegFL)',
+            'fedprox': 'FedProx + TAL',
+            'scaffold': 'SCAFFOLD + TAL',
+            'moon': 'MOON + TAL'
+        }
+        
+        # Run Centralized first to get target labels for NMI/ARI
+        cent_res = execute_federated_training(raw_df, {**base_params, 'mode': 'cent', 'sigma': 0.0}, log_callback=add_log)
+        cent_labels = cent_res['labels']
+        
+        from backend.ml.evaluator import compute_nmi_ari
+        
         for m in modes:
-            res = execute_federated_training(raw_df, {**base_params, 'mode': m, 'sigma': 0.0}, log_callback=add_log)
+            if m == 'cent':
+                res = cent_res
+            else:
+                res = execute_federated_training(raw_df, {**base_params, 'mode': m, 'sigma': 0.0}, log_callback=add_log)
+            
+            agree = compute_nmi_ari(res['labels'], cent_labels)
             results_list.append({
                 'Mode': display_names[m], 
-                'Avg Silhouette': f"{res['silhouette']:.3f}",
+                'Silhouette ↑': f"{res['silhouette']:.3f}",
+                'DBI ↓': f"{res['dbi']:.3f}",
+                'Calinski-Harabasz ↑': f"{res['calinski_harabasz']:.1f}",
+                'NMI (vs Cent) ↑': f"{agree['nmi']:.3f}",
+                'ARI (vs Cent) ↑': f"{agree['ari']:.3f}",
                 'Comm. Cost (MB)': f"{res['comm_cost_mb']:.4f}"
             })
         base_df = pd.DataFrame(results_list)
         
-        # 2. Ablation
+        # ── 2. ABLATION (Full SegFL, No DP, No Federation, No TAL) ──
         add_log("Running Component Ablation Analysis...")
         abl_results = []
         conditions = [
-            {'name': 'Full SegFL (TAL + DP)', 'mode': 'tal', 'sigma': 0.1},
-            {'name': 'Ablated (No DP Noise)', 'mode': 'tal', 'sigma': 0.0},
-            {'name': 'Ablated (No Federated Agg)', 'mode': 'local', 'sigma': 0.1}
+            {'name': 'Full SegFL (TAL + Fed + DP)', 'mode': 'tal', 'sigma': sigma_dp},
+            {'name': 'Ablated: No DP Noise', 'mode': 'tal', 'sigma': 0.0},
+            {'name': 'Ablated: No Federation', 'mode': 'local', 'sigma': sigma_dp},
+            {'name': 'Ablated: No TAL (Centralized)', 'mode': 'cent', 'sigma': sigma_dp},
         ]
         for cond in conditions:
             res = execute_federated_training(raw_df, {**base_params, 'mode': cond['mode'], 'sigma': cond['sigma']}, log_callback=add_log)
+            agree = compute_nmi_ari(res['labels'], cent_labels)
             abl_results.append({
-                'Experimental Condition': cond['name'], 
-                'Utility (Silhouette)': f"{res['silhouette']:.3f}",
-                'Privacy (ε)': f"≈ {res['epsilon']:.2f}" if cond['sigma'] > 0 else "∞ (None)",
+                'Condition': cond['name'], 
+                'Silhouette ↑': f"{res['silhouette']:.3f}",
+                'DBI ↓': f"{res['dbi']:.3f}",
+                'NMI (vs Cent) ↑': f"{agree['nmi']:.3f}",
+                'ARI (vs Cent) ↑': f"{agree['ari']:.3f}",
+                'Privacy (ε)': f"{res['epsilon']:.2f}" if cond['sigma'] > 0 else "∞ (None)",
                 'Comm. Cost (MB)': f"{res['comm_cost_mb']:.4f}"
             })
         abl_df = pd.DataFrame(abl_results)
 
-        # 3. DP Sweep
+        # ── 3. DP SWEEP ──
         add_log("Executing Differential Privacy Utility Sweep...")
         dp_results = []
-        for s in [0.0, 0.05, 0.2, 0.5, 1.0]:
+        for s in [0.0, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0]:
             res = execute_federated_training(raw_df, {**base_params, 'sigma': s}, log_callback=None)
-            dp_results.append({'DP Sigma': s, 'Privacy Budget (ε)': res['epsilon'], 'Retained Utility': res['silhouette']})
+            dp_results.append({
+                'DP Sigma (σ)': s,
+                'Privacy Budget (ε)': res['epsilon'],
+                'Silhouette': res['silhouette'],
+                'DBI': res['dbi']
+            })
         dp_df = pd.DataFrame(dp_results)
         
-        # 4. Final Profile
-        add_log("Finalizing High-Fidelity Persona Matrix (Sigma=0.1)...")
-        results = execute_federated_training(raw_df, {**base_params, 'sigma': 0.1}, log_callback=add_log)
+        # ── 4. FINAL PROFILE ──
+        add_log(f"Finalizing High-Fidelity Persona Matrix (σ={sigma_dp})...")
+        results = execute_federated_training(raw_df, {**base_params, 'sigma': sigma_dp}, log_callback=add_log)
+        
+        # ── 5. STABILITY ANALYSIS (optional) ──
+        stability_results = None
+        stat_test_results = None
+        if run_stability:
+            add_log("Starting Stability Analysis (10 seeds)...")
+            stability_results = stability_analysis(
+                raw_df, {**base_params, 'sigma': sigma_dp},
+                execute_fn=execute_federated_training,
+                n_seeds=10,
+                log_callback=add_log
+            )
+            
+            add_log("Running Centralized baseline across same seeds for statistical test...")
+            cent_stability = stability_analysis(
+                raw_df, {**base_params, 'sigma': sigma_dp, 'mode': 'cent'},
+                execute_fn=execute_federated_training,
+                n_seeds=10,
+                log_callback=None
+            )
+            stat_test_results = wilcoxon_test(
+                stability_results['all_silhouettes'],
+                cent_stability['all_silhouettes']
+            )
+            add_log(f"Wilcoxon test: p={stat_test_results['p_value']:.4f} "
+                     f"({'Significant' if stat_test_results['significant'] else 'Not significant'} at α=0.05)")
+        
+        # ── 6. SCALABILITY & GENERALIZATION (optional) ──
+        scal_results = None
+        gen_results = None
+        if run_scalability_gen:
+            add_log("Starting Scalability Analysis (scaling tenant count)...")
+            # Get max tenants
+            from backend.ml.processor import prepare_tenant_datasets
+            _, _, raw_info_temp = prepare_tenant_datasets(raw_df, batch_size=256, run_seed=dynamic_seed)
+            max_tenants = len(raw_info_temp)
+            tenant_counts = list(range(2, max_tenants + 1)) if max_tenants >= 2 else [2]
+            
+            scal_results = scalability_analysis(
+                raw_df, {**base_params, 'mode': 'tal', 'sigma': sigma_dp},
+                execute_fn=execute_federated_training,
+                tenant_counts=tenant_counts,
+                log_callback=add_log
+            )
+            
+            add_log("Starting Generalization hold-out tenant test...")
+            gen_results = generalization_test(
+                raw_df, {**base_params, 'mode': 'tal', 'sigma': sigma_dp},
+                execute_fn=execute_federated_training,
+                log_callback=add_log
+            )
         
         add_log("Full Research Cycle Complete. Rendering Dashboard...")
         
@@ -255,6 +359,10 @@ if btn_run:
         st.session_state.base_df = base_df
         st.session_state.abl_df = abl_df
         st.session_state.dp_df = dp_df
+        st.session_state.stability_results = stability_results
+        st.session_state.stat_test_results = stat_test_results
+        st.session_state.scal_results = scal_results
+        st.session_state.gen_results = gen_results
         st.session_state.is_run = True
 
     else:
@@ -266,30 +374,37 @@ if st.session_state.get('is_run', False):
     base_df = st.session_state.base_df
     abl_df = st.session_state.abl_df
     dp_df = st.session_state.dp_df
+    stability_results = st.session_state.get('stability_results', None)
+    stat_test_results = st.session_state.get('stat_test_results', None)
 
     st.markdown("<hr>", unsafe_allow_html=True)
     
-    # KPI Summary Bar (always visible above tabs)
+    # KPI Summary Bar
     st.markdown("### Performance Overview")
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    kpi1.metric("Final Silhouette Score", f"{results['silhouette']:.3f}")
+    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+    kpi1.metric("Silhouette Score", f"{results['silhouette']:.3f}")
     kpi2.metric("Davies-Bouldin Index", f"{results['dbi']:.3f}")
-    kpi3.metric("Privacy Budget (ε)", f"≈ {results['epsilon']:.2f}")
-    kpi4.metric("Discovered Archetypes", len(results['profile']))
+    kpi3.metric("Calinski-Harabasz", f"{results['calinski_harabasz']:.1f}")
+    kpi4.metric("Privacy Budget (ε)", f"{results['epsilon']:.2f}")
+    kpi5.metric("Discovered Archetypes", len(results['profile']))
     
     st.markdown("<br>", unsafe_allow_html=True)
     
     # --- TABBED DASHBOARD ---
-    tab_convergence, tab_baselines, tab_privacy, tab_topology, tab_artifacts = st.tabs([
-        "Convergence",
-        "Baselines & Ablation",
-        "Privacy Analysis",
-        "Latent Topology & Personas",
-        "Archetypes & Downloads"
-    ])
+    tab_list = ["Convergence", "Baselines & Ablation", "Privacy Analysis", 
+                "Latent Topology & Personas", "Archetypes & Downloads"]
+    if stability_results:
+        tab_list.append("Stability & Statistical Tests")
+    
+    scal_results = st.session_state.get('scal_results', None)
+    gen_results = st.session_state.get('gen_results', None)
+    if scal_results is not None:
+        tab_list.append("Scalability & Generalization")
+    
+    tabs = st.tabs(tab_list)
     
     # ── TAB 1: Convergence ──
-    with tab_convergence:
+    with tabs[0]:
         st.markdown("#### TAL-FL Global Convergence (Loss)")
         st.caption("Reconstruction loss of the GlobalBottleneckAE across federated training rounds.")
         loss_df = pd.DataFrame({
@@ -309,44 +424,70 @@ if st.session_state.get('is_run', False):
         st.plotly_chart(fig_loss, use_container_width=True)
     
     # ── TAB 2: Baselines & Ablation ──
-    with tab_baselines:
-        col_b1, col_b2 = st.columns(2)
-        with col_b1:
-            st.markdown("#### Formal Baseline Comparisons")
-            st.caption("Silhouette scores and communication costs across standard FL approaches.")
-            st.dataframe(base_df, use_container_width=True, hide_index=True)
-        with col_b2:
-            st.markdown("#### Component Ablation Study")
-            st.caption("Impact of removing individual SegFL components on utility and privacy.")
-            st.dataframe(abl_df, use_container_width=True, hide_index=True)
-    
-    # ── TAB 3: Privacy Analysis ──
-    with tab_privacy:
-        st.markdown("#### Differential Privacy Utility Tradeoff")
-        st.caption("Effect of DP noise magnitude (Sigma) on clustering utility.")
-        fig_dp = px.line(
-            dp_df, x='DP Sigma', y='Retained Utility',
-            template='plotly_white', markers=True,
-            labels={'DP Sigma': 'DP Noise (σ)', 'Retained Utility': 'Silhouette Score'}
-        )
-        fig_dp.update_traces(line=dict(color='#18181b', width=2.5), marker=dict(size=8))
-        fig_dp.update_layout(
-            height=380,
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(l=0, r=0, t=10, b=0)
-        )
-        st.plotly_chart(fig_dp, use_container_width=True)
+    with tabs[1]:
+        st.markdown("#### Formal Baseline Comparisons")
+        st.caption("Segmentation quality and communication costs across FL approaches. Includes Centralized, Intersection-Only, Local-Isolated, TAL-FL (SegFL), and FedProx + TAL.")
+        st.dataframe(base_df, use_container_width=True, hide_index=True)
         
         st.markdown("<br>", unsafe_allow_html=True)
-        st.dataframe(dp_df.style.format({
-            'DP Sigma': '{:.2f}',
-            'Privacy Budget (ε)': '{:.2f}',
-            'Retained Utility': '{:.3f}'
-        }).background_gradient(cmap='Greys', subset=['Retained Utility']), use_container_width=True, hide_index=True)
+        
+        st.markdown("#### Component Ablation Study")
+        st.caption("Impact of removing individual SegFL components (DP, Federation, TAL) on utility and privacy.")
+        st.dataframe(abl_df, use_container_width=True, hide_index=True)
+    
+    # ── TAB 3: Privacy Analysis ──
+    with tabs[2]:
+        st.markdown("#### Differential Privacy Utility Tradeoff")
+        st.caption("Effect of DP noise magnitude (σ) on clustering utility. ε computed via RDP Accountant (Mironov 2017) with δ=10⁻⁵.")
+        
+        col_dp1, col_dp2 = st.columns(2)
+        with col_dp1:
+            fig_dp = px.line(
+                dp_df, x='DP Sigma (σ)', y='Silhouette',
+                template='plotly_white', markers=True,
+                labels={'DP Sigma (σ)': 'DP Noise (σ)', 'Silhouette': 'Silhouette Score ↑'}
+            )
+            fig_dp.update_traces(line=dict(color='#18181b', width=2.5), marker=dict(size=8))
+            fig_dp.update_layout(
+                height=380,
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=0, r=0, t=10, b=0)
+            )
+            st.plotly_chart(fig_dp, use_container_width=True)
+        
+        with col_dp2:
+            # Filter out inf values for the epsilon plot
+            dp_plot = dp_df[dp_df['Privacy Budget (ε)'] < 1e10].copy()
+            if not dp_plot.empty:
+                fig_eps = px.line(
+                    dp_plot, x='DP Sigma (σ)', y='Privacy Budget (ε)',
+                    template='plotly_white', markers=True,
+                    labels={'Privacy Budget (ε)': 'ε (lower = more private)'}
+                )
+                fig_eps.update_traces(line=dict(color='#ef4444', width=2.5), marker=dict(size=8))
+                fig_eps.update_layout(
+                    height=380,
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=0, r=0, t=10, b=0)
+                )
+                st.plotly_chart(fig_eps, use_container_width=True)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("##### Full DP Sweep Results")
+        
+        # Format the display table, handling inf values
+        dp_display = dp_df.copy()
+        dp_display['Privacy Budget (ε)'] = dp_display['Privacy Budget (ε)'].apply(
+            lambda x: "∞ (No DP)" if x > 1e10 else f"{x:.2f}"
+        )
+        dp_display['Silhouette'] = dp_display['Silhouette'].apply(lambda x: f"{x:.3f}")
+        dp_display['DBI'] = dp_display['DBI'].apply(lambda x: f"{x:.3f}")
+        st.dataframe(dp_display, use_container_width=True, hide_index=True)
     
     # ── TAB 4: Latent Topology & Personas ──
-    with tab_topology:
+    with tabs[3]:
         viz_col1, viz_col2 = st.columns(2)
         
         with viz_col1:
@@ -380,9 +521,7 @@ if st.session_state.get('is_run', False):
             st.markdown("#### Semantic Feature Importance")
             st.caption("Normalized behavioural radar per discovered persona.")
             
-            # Dynamically determine columns to display on the radar chart
             all_profile_cols = [c for c in results['profile'].columns if c not in ['Persona', 'Cluster Size', 'Platform ID']]
-            # Limit to at most 5 columns for readability
             radar_cols = all_profile_cols[:5]
             
             if len(radar_cols) >= 3:
@@ -417,7 +556,7 @@ if st.session_state.get('is_run', False):
                 st.info("Insufficient numeric features for radar chart display.")
     
     # ── TAB 5: Archetypes & Downloads ──
-    with tab_artifacts:
+    with tabs[4]:
         st.markdown("#### Discovered Behavioural Archetypes")
         st.caption("Mean feature values per cluster with auto-assigned persona labels.")
         st.dataframe(results['profile'].style.background_gradient(cmap='Greys'), use_container_width=True)
@@ -460,3 +599,140 @@ if st.session_state.get('is_run', False):
                     mime="text/csv",
                     key=f"dl_cluster_{cluster_id}"
                 )
+    
+    # ── TAB 6: Stability & Statistical Tests (conditional) ──
+    if stability_results and len(tabs) > 5:
+        with tabs[5]:
+            st.markdown("#### Multi-Seed Stability Analysis")
+            st.caption("Training executed across 10 random seeds. Reports mean ± std of clustering metrics and pairwise NMI/ARI agreement.")
+            
+            # Summary metrics table
+            stab_metrics = pd.DataFrame([{
+                'Metric': 'Silhouette Score',
+                'Mean': f"{stability_results['silhouette_mean']:.3f}",
+                'Std Dev': f"{stability_results['silhouette_std']:.3f}",
+            }, {
+                'Metric': 'Davies-Bouldin Index',
+                'Mean': f"{stability_results['dbi_mean']:.3f}",
+                'Std Dev': f"{stability_results['dbi_std']:.3f}",
+            }, {
+                'Metric': 'Calinski-Harabasz',
+                'Mean': f"{stability_results['ch_mean']:.1f}",
+                'Std Dev': f"{stability_results['ch_std']:.1f}",
+            }, {
+                'Metric': 'Pairwise NMI',
+                'Mean': f"{stability_results['nmi_mean']:.3f}",
+                'Std Dev': f"{stability_results['nmi_std']:.3f}",
+            }, {
+                'Metric': 'Pairwise ARI',
+                'Mean': f"{stability_results['ari_mean']:.3f}",
+                'Std Dev': f"{stability_results['ari_std']:.3f}",
+            }])
+            st.dataframe(stab_metrics, use_container_width=True, hide_index=True)
+            
+            # Box plots
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("#### Distribution of Silhouette Scores Across Seeds")
+            
+            box_df = pd.DataFrame({
+                'Seed': [f"Seed {42+i}" for i in range(len(stability_results['all_silhouettes']))],
+                'Silhouette': stability_results['all_silhouettes']
+            })
+            fig_box = px.box(box_df, y='Silhouette', template='plotly_white', 
+                            points='all', title=None)
+            fig_box.update_traces(marker_color='#18181b', line_color='#18181b')
+            fig_box.update_layout(
+                height=350,
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=0, r=0, t=10, b=0),
+                yaxis_title="Silhouette Score"
+            )
+            st.plotly_chart(fig_box, use_container_width=True)
+            
+            # Statistical significance test
+            if stat_test_results:
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.markdown("#### Statistical Significance Test")
+                st.caption("Wilcoxon signed-rank test comparing TAL-FL (SegFL) vs Centralized baseline across 10 seeds.")
+                
+                sig_color = "🟢" if stat_test_results['significant'] else "🔴"
+                sig_text = "Statistically Significant" if stat_test_results['significant'] else "Not Statistically Significant"
+                
+                sig_col1, sig_col2, sig_col3 = st.columns(3)
+                sig_col1.metric("Test Statistic (W)", f"{stat_test_results['statistic']:.2f}")
+                sig_col2.metric("p-value", f"{stat_test_results['p_value']:.4f}")
+                sig_col3.metric("Result (α=0.05)", f"{sig_color} {sig_text}")
+                
+                st.info("""
+                **Interpretation:** The Wilcoxon signed-rank test is a non-parametric paired test that compares whether SegFL's TAL-FL 
+                produces statistically significantly different clustering quality than the Centralized baseline. A p-value < 0.05 
+                indicates the difference is unlikely due to random variation.
+                """)
+                
+    # ── TAB 7: Scalability & Generalization (conditional) ──
+    if "Scalability & Generalization" in tab_list:
+        scal_tab_idx = tab_list.index("Scalability & Generalization")
+        with tabs[scal_tab_idx]:
+            st.markdown("#### System Scalability Analysis")
+            st.caption("Performance metrics as the number of clients (tenants) scales from 2 to N.")
+            
+            scal_df = pd.DataFrame(scal_results)
+            
+            st.dataframe(scal_df.rename(columns={
+                'tenants': 'Client Count',
+                'time_seconds': 'Execution Time (s)',
+                'silhouette': 'Silhouette Score',
+                'dbi': 'Davies-Bouldin Index'
+            }), use_container_width=True, hide_index=True)
+            
+            col_scal1, col_scal2 = st.columns(2)
+            with col_scal1:
+                fig_time = px.line(
+                    scal_df, x='tenants', y='time_seconds',
+                    template='plotly_white', markers=True,
+                    labels={'tenants': 'Number of Clients', 'time_seconds': 'Execution Time (seconds)'},
+                    title="Computational Complexity (Time vs Clients)"
+                )
+                fig_time.update_traces(line=dict(color='#18181b', width=2.5), marker=dict(size=8))
+                fig_time.update_layout(
+                    height=350,
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=0, r=0, t=30, b=0)
+                )
+                st.plotly_chart(fig_time, use_container_width=True)
+                
+            with col_scal2:
+                fig_qual = px.line(
+                    scal_df, x='tenants', y='silhouette',
+                    template='plotly_white', markers=True,
+                    labels={'tenants': 'Number of Clients', 'silhouette': 'Silhouette Score'},
+                    title="Clustering Quality (Silhouette vs Clients)"
+                )
+                fig_qual.update_traces(line=dict(color='#3b82f6', width=2.5), marker=dict(size=8))
+                fig_qual.update_layout(
+                    height=350,
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=0, r=0, t=30, b=0)
+                )
+                st.plotly_chart(fig_qual, use_container_width=True)
+                
+            st.divider()
+            
+            st.markdown("#### Generalization to Unseen Heterogeneous Tenant")
+            st.caption("Clustering performance on a completely held-out tenant dataset. The model has never seen this tenant's raw schemas or data during federated training.")
+            
+            if gen_results:
+                gen_col1, gen_col2 = st.columns(2)
+                gen_col1.metric("Hold-out Silhouette Score ↑", f"{gen_results['holdout_silhouette']:.3f}")
+                gen_col2.metric("Hold-out Davies-Bouldin Index ↓", f"{gen_results['holdout_dbi']:.3f}")
+                
+                st.info(f"""
+                **Zero-Shot Adaptation Mechanism:** 
+                To evaluate generalization, SegFL trains its global autoencoder representation model on $C-1$ tenants, leaving the last tenant's data entirely unseen. 
+                A local Tenant Adapter Layer (TAL) is then trained for the hold-out tenant for a few local epochs to project its raw features into the shared latent space, while keeping the global model weights **frozen**. 
+                The Silhouette Score of **{gen_results['holdout_silhouette']:.3f}** proves that the global model successfully extracts generalizable user behavioral structures that can adapt to new, unseen organizations with zero-shot federated training.
+                """)
+

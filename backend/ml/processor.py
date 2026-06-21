@@ -6,6 +6,50 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 import os
 
+def validate_dataframe(df, log_fn=None):
+    """
+    Validate and clean a DataFrame:
+      - Reports and imputes missing values (median for numeric, mode for categorical)
+      - Clips outliers via IQR method (3×IQR threshold)
+      - Reports data quality summary
+    """
+    if log_fn is None:
+        log_fn = print
+
+    # 1. Missing value handling
+    missing = df.isnull().sum()
+    if missing.any():
+        missing_report = dict(missing[missing > 0])
+        log_fn(f"⚠️ Missing values detected: {missing_report}")
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            if df[col].isnull().any():
+                df[col] = df[col].fillna(df[col].median())
+        cat_cols = df.select_dtypes(include=['object', 'category']).columns
+        for col in cat_cols:
+            if df[col].isnull().any():
+                mode_val = df[col].mode()
+                df[col] = df[col].fillna(mode_val.iloc[0] if not mode_val.empty else 'unknown')
+
+    # 2. Outlier clipping (IQR method, 3× threshold)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    outlier_count = 0
+    for col in numeric_cols:
+        Q1, Q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+        IQR = Q3 - Q1
+        if IQR > 0:
+            lower, upper = Q1 - 3.0 * IQR, Q3 + 3.0 * IQR
+            outliers = ((df[col] < lower) | (df[col] > upper)).sum()
+            if outliers > 0:
+                outlier_count += outliers
+                df[col] = df[col].clip(lower, upper)
+    if outlier_count > 0:
+        log_fn(f"📊 Clipped {outlier_count} outlier values (3×IQR method).")
+
+    # 3. Data quality summary
+    log_fn(f"✅ Data validated: {len(df)} rows × {len(df.columns)} columns.")
+    return df
+
 def process_csv(file_path, nrows=500_000, data_dir=None):
     """
     Enhanced CSV processor.
@@ -46,7 +90,8 @@ def process_csv(file_path, nrows=500_000, data_dir=None):
 
 def _extract_behavioural_heuristics(df):
     print("⚙️ Computing Semantic Behavioural Heuristics...")
-    # Clean data
+    # Validate and clean data
+    df = validate_dataframe(df)
     df = df.dropna()
     
     # Heuristics
@@ -65,8 +110,8 @@ def _extract_behavioural_heuristics(df):
 
 def _extract_generic_features(df):
     print("⚙️ Applying Generic Feature Extraction...")
-    # Drop non-numeric columns and identifier-like columns
-    # We'll assume the first column might be an ID if it's object or int with high cardinality
+    # Validate and clean data
+    df = validate_dataframe(df)
     df = df.dropna()
     
     # Crude way to find a 'grouping' column like platform. 
