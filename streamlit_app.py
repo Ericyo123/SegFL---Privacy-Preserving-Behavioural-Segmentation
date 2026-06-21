@@ -151,8 +151,22 @@ with st.sidebar:
     st.header("Protocol Settings")
     use_local = st.checkbox("Use Local Project Data (backend/data/)", value=True)
     
+    local_file_choice = None
     uploaded_file = None
-    if not use_local:
+    if use_local:
+        data_dir = os.path.join("backend", "data")
+        os.makedirs(data_dir, exist_ok=True)
+        csvs = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
+        if csvs:
+            if "clicks_train.csv" in csvs:
+                csvs.remove("clicks_train.csv")
+                csvs = ["clicks_train.csv"] + sorted(csvs)
+            else:
+                csvs = sorted(csvs)
+            local_file_choice = st.selectbox("Select local CSV file", csvs)
+        else:
+            st.warning("No local CSV files found in `backend/data/`. Please copy your dataset files there.")
+    else:
         uploaded_file = st.file_uploader("Upload behavioural CSV", type=["csv"])
     
     nrows = st.number_input("Scan Rows", min_value=1000, max_value=100000000, value=50000, step=5000)
@@ -188,17 +202,10 @@ if btn_run:
     file_to_process = None
     
     if use_local:
-        data_dir = os.path.join("backend", "data")
-        os.makedirs(data_dir, exist_ok=True)
-        click_path = os.path.join(data_dir, "clicks_train.csv")
-        if os.path.exists(click_path): 
-            file_to_process = click_path
+        if local_file_choice:
+            file_to_process = os.path.join("backend", "data", local_file_choice)
         else:
-            csvs = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
-            if csvs: 
-                file_to_process = os.path.join(data_dir, csvs[0])
-            else:
-                st.warning("No local datasets found in `backend/data/`. Please copy `clicks_train.csv` there.")
+            st.warning("No local dataset selected. Please copy CSV files to `backend/data/`.")
     elif uploaded_file:
         os.makedirs("temp", exist_ok=True)
         file_to_process = os.path.join("temp", uploaded_file.name)
