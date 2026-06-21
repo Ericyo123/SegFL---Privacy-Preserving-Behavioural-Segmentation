@@ -350,7 +350,14 @@ if btn_run:
             from backend.ml.processor import prepare_tenant_datasets
             _, _, raw_info_temp = prepare_tenant_datasets(sweep_df, batch_size=256, run_seed=dynamic_seed)
             max_tenants = len(raw_info_temp)
-            tenant_counts = list(range(2, max_tenants + 1)) if max_tenants >= 2 else [2]
+            if max_tenants >= 2:
+                if max_tenants <= 5:
+                    tenant_counts = list(range(2, max_tenants + 1))
+                else:
+                    # Choose up to 5 evenly spaced integers between 2 and max_tenants
+                    tenant_counts = sorted(list(set(np.linspace(2, max_tenants, 5, dtype=int))))
+            else:
+                tenant_counts = [2]
             
             scal_results = scalability_analysis(
                 sweep_df, {**base_params, 'mode': 'tal', 'sigma': sigma_dp},
