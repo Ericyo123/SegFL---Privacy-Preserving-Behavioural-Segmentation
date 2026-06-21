@@ -224,6 +224,12 @@ if btn_run:
         add_log("Loading dataset into memory...")
         raw_df = cached_process_csv(file_to_process, nrows=nrows)
         
+        # Sample representative subset for comparative sweeps to keep runtime tractable on CPU
+        sweep_df = raw_df
+        if len(raw_df) > 10000:
+            add_log("🔬 Dataset size is large. Downsampling to 10,000 rows for comparisons and sweeps to maintain CPU tractability...")
+            sweep_df = raw_df.sample(n=10000, random_state=dynamic_seed).reset_index(drop=True)
+        
         # ── 1. BASELINES (Centralized, Intersection, Local, TAL-FL, FedProx, SCAFFOLD, MOON) ──
         add_log("Initializing Baseline Comparisons...")
         results_list = []
@@ -239,7 +245,7 @@ if btn_run:
         }
         
         # Run Centralized first to get target labels for NMI/ARI
-        cent_res = execute_federated_training(raw_df, {**base_params, 'mode': 'cent', 'sigma': 0.0}, log_callback=add_log)
+        cent_res = execute_federated_training(sweep_df, {**base_params, 'mode': 'cent', 'sigma': 0.0}, log_callback=add_log)
         cent_labels = cent_res['labels']
         
         from backend.ml.evaluator import compute_nmi_ari
@@ -248,7 +254,7 @@ if btn_run:
             if m == 'cent':
                 res = cent_res
             else:
-                res = execute_federated_training(raw_df, {**base_params, 'mode': m, 'sigma': 0.0}, log_callback=add_log)
+                res = execute_federated_training(sweep_df, {**base_params, 'mode': m, 'sigma': 0.0}, log_callback=add_log)
             
             agree = compute_nmi_ari(res['labels'], cent_labels)
             results_list.append({
@@ -272,7 +278,7 @@ if btn_run:
             {'name': 'Ablated: No TAL (Centralized)', 'mode': 'cent', 'sigma': sigma_dp},
         ]
         for cond in conditions:
-            res = execute_federated_training(raw_df, {**base_params, 'mode': cond['mode'], 'sigma': cond['sigma']}, log_callback=add_log)
+            res = execute_federated_training(sweep_df, {**base_params, 'mode': cond['mode'], 'sigma': cond['sigma']}, log_callback=add_log)
             agree = compute_nmi_ari(res['labels'], cent_labels)
             abl_results.append({
                 'Condition': cond['name'], 
@@ -289,7 +295,8 @@ if btn_run:
         add_log("Executing Differential Privacy Utility Sweep...")
         dp_results = []
         for s in [0.0, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0]:
-            res = execute_federated_training(raw_df, {**base_params, 'sigma': s}, log_callback=None)
+            add_log(f"Sweeping DP Noise Multiplier (σ) = {s}...")
+            res = execute_federated_training(sweep_df, {**base_params, 'sigma': s}, log_callback=None)
             dp_results.append({
                 'DP Sigma (σ)': s,
                 'Privacy Budget (ε)': res['epsilon'],
@@ -299,7 +306,7 @@ if btn_run:
         dp_df = pd.DataFrame(dp_results)
         
         # ── 4. FINAL PROFILE ──
-        add_log(f"Finalizing High-Fidelity Persona Matrix (σ={sigma_dp})...")
+        add_log(f"Finalizing High-Fidelity Persona Matrix (σ={sigma_dp}) on Full Dataset...")
         results = execute_federated_training(raw_df, {**base_params, 'sigma': sigma_dp}, log_callback=add_log)
         
         # ── 5. STABILITY ANALYSIS (optional) ──
@@ -308,7 +315,7 @@ if btn_run:
         if run_stability:
             add_log("Starting Stability Analysis (10 seeds)...")
             stability_results = stability_analysis(
-                raw_df, {**base_params, 'sigma': sigma_dp},
+                sweep_df, {**base_params, 'sigma': sigma_dp},
                 execute_fn=execute_federated_training,
                 n_seeds=10,
                 log_callback=add_log
@@ -316,7 +323,7 @@ if btn_run:
             
             add_log("Running Centralized baseline across same seeds for statistical test...")
             cent_stability = stability_analysis(
-                raw_df, {**base_params, 'sigma': sigma_dp, 'mode': 'cent'},
+                sweep_df, {**base_params, 'sigma': sigma_dp, 'mode': 'cent'},
                 execute_fn=execute_federated_training,
                 n_seeds=10,
                 log_callback=None
@@ -333,14 +340,13 @@ if btn_run:
         gen_results = None
         if run_scalability_gen:
             add_log("Starting Scalability Analysis (scaling tenant count)...")
-            # Get max tenants
             from backend.ml.processor import prepare_tenant_datasets
-            _, _, raw_info_temp = prepare_tenant_datasets(raw_df, batch_size=256, run_seed=dynamic_seed)
+            _, _, raw_info_temp = prepare_tenant_datasets(sweep_df, batch_size=256, run_seed=dynamic_seed)
             max_tenants = len(raw_info_temp)
             tenant_counts = list(range(2, max_tenants + 1)) if max_tenants >= 2 else [2]
             
             scal_results = scalability_analysis(
-                raw_df, {**base_params, 'mode': 'tal', 'sigma': sigma_dp},
+                sweep_df, {**base_params, 'mode': 'tal', 'sigma': sigma_dp},
                 execute_fn=execute_federated_training,
                 tenant_counts=tenant_counts,
                 log_callback=add_log
@@ -348,7 +354,7 @@ if btn_run:
             
             add_log("Starting Generalization hold-out tenant test...")
             gen_results = generalization_test(
-                raw_df, {**base_params, 'mode': 'tal', 'sigma': sigma_dp},
+                sweep_df, {**base_params, 'mode': 'tal', 'sigma': sigma_dp},
                 execute_fn=execute_federated_training,
                 log_callback=add_log
             )
