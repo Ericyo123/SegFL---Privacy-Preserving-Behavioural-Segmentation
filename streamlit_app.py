@@ -449,11 +449,15 @@ if st.session_state.get('is_run', False):
     # KPI Summary Bar
     st.markdown("### Performance Overview")
     kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-    kpi1.metric("Silhouette Score", f"{results['silhouette']:.3f}")
-    kpi2.metric("Davies-Bouldin Index", f"{results['dbi']:.3f}")
-    kpi3.metric("Calinski-Harabasz", f"{results['calinski_harabasz']:.1f}")
-    kpi4.metric("Privacy Budget (ε)", f"{results['epsilon']:.2f}")
-    kpi5.metric("Discovered Archetypes", len(results['profile']))
+    kpi1.metric("Silhouette Score", f"{results.get('silhouette', 0.0):.3f}")
+    kpi2.metric("Davies-Bouldin Index", f"{results.get('dbi', 0.0):.3f}")
+    kpi3.metric("Calinski-Harabasz", f"{results.get('calinski_harabasz', 0.0):.1f}")
+    
+    eps = results.get('epsilon', float('inf'))
+    eps_str = f"{eps:.2f}" if eps != float('inf') else "∞"
+    kpi4.metric("Privacy Budget (ε)", eps_str)
+    
+    kpi5.metric("Discovered Archetypes", len(results.get('profile', [])))
     
     st.markdown("<br>", unsafe_allow_html=True)
     
