@@ -136,7 +136,7 @@ def _extract_generic_features(df):
     
     return features
 
-def prepare_tenant_datasets(df, batch_size=256, run_seed=None):
+def prepare_tenant_datasets(df, batch_size=256, run_seed=None, feature_masks=None):
     if run_seed is None:
         run_seed = np.random.randint(10000)
         
@@ -156,16 +156,33 @@ def prepare_tenant_datasets(df, batch_size=256, run_seed=None):
             
         # ── INJECT FEATURE HETEROGENEITY ──
         active_features = all_features.copy()
-        if p_id == 1 and len(active_features) >= 3:
-            if 'ent' in active_features:
-                active_features = [c for c in active_features if c not in ['ent', 'hr_var']]
-            else:
-                active_features = active_features[:-1] # Generic CSV fallback
-        elif p_id == 2 and len(active_features) >= 3:
-            if 'hr_mean' in active_features:
-                active_features = [c for c in active_features if c not in ['hr_mean', 'hr_var']]
-            else:
-                active_features = active_features[1:] # Generic CSV fallback
+        
+        # Bounding heterogeneity injection via feature_masks parameter
+        mask = None
+        if feature_masks is not None:
+            if p_id in feature_masks:
+                mask = feature_masks[p_id]
+            elif str(p_id) in feature_masks:
+                mask = feature_masks[str(p_id)]
+            elif plat in feature_masks:
+                mask = feature_masks[plat]
+            elif str(plat) in feature_masks:
+                mask = feature_masks[str(plat)]
+                
+        if mask is not None:
+            active_features = [c for c in active_features if c not in mask]
+        else:
+            # Default fallback legacy behavior to maintain compatibility
+            if p_id == 1 and len(active_features) >= 3:
+                if 'ent' in active_features:
+                    active_features = [c for c in active_features if c not in ['ent', 'hr_var']]
+                else:
+                    active_features = active_features[:-1] # Generic CSV fallback
+            elif p_id == 2 and len(active_features) >= 3:
+                if 'hr_mean' in active_features:
+                    active_features = [c for c in active_features if c not in ['hr_mean', 'hr_var']]
+                else:
+                    active_features = active_features[1:] # Generic CSV fallback
             
         feats = StandardScaler().fit_transform(local_df[active_features].values)
 

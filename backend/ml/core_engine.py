@@ -498,16 +498,38 @@ def execute_federated_training(raw_df, params, log_callback=None):
             all_dbis.append(davies_bouldin_score(lt, fed_labels[i]))
             all_chs.append(calinski_harabasz_score(lt, fed_labels[i]))
 
-    # 7. Profile Construction
-    eval_target_df = raw_info[0]['raw_target'].tail(len(fed_labels[0])).copy()
-    eval_target_df['cluster'] = fed_labels[0]
-
-    unique_labels = sorted(list(np.unique(fed_labels[0])))
-    means = eval_target_df.groupby('cluster').mean(numeric_only=True).round(3)
-    sizes = eval_target_df.groupby('cluster').size()
-
-    profile = means.reindex(unique_labels).fillna(0)
-    profile['Cluster Size'] = sizes.reindex(unique_labels).fillna(0).astype(int)
+    # 7. Profile Construction (Privacy-Preserving via local sufficient statistics)
+    import pandas as pd
+    
+    feature_cols = [c for c in raw_info[0]['raw_target'].columns if c not in ['uuid', 'plat', 'platform', 'cluster']]
+    unique_labels = sorted(list(np.unique(np.concatenate(fed_labels))))
+    
+    global_sums = {c: np.zeros(len(feature_cols)) for c in unique_labels}
+    global_counts = {c: 0 for c in unique_labels}
+    
+    for i, labels_i in enumerate(fed_labels):
+        client_df = raw_info[i]['raw_target'].copy()
+        client_df = client_df.tail(len(labels_i))
+        client_df['cluster'] = labels_i
+        
+        for c in unique_labels:
+            cluster_data = client_df[client_df['cluster'] == c][feature_cols]
+            if len(cluster_data) > 0:
+                global_sums[c] += cluster_data.sum(numeric_only=True).values
+                global_counts[c] += len(cluster_data)
+                
+    profile_rows = []
+    for c in unique_labels:
+        if global_counts[c] > 0:
+            mean_vals = global_sums[c] / global_counts[c]
+        else:
+            mean_vals = np.zeros(len(feature_cols))
+        row = dict(zip(feature_cols, mean_vals))
+        row['cluster'] = c
+        row['Cluster Size'] = int(global_counts[c])
+        profile_rows.append(row)
+        
+    profile = pd.DataFrame(profile_rows).set_index('cluster')
     profile['Persona'] = get_segment_personas(profile)
 
     # Rename columns to full academic terms
@@ -520,6 +542,10 @@ def execute_federated_training(raw_df, params, log_callback=None):
         'plat': 'Platform ID'
     }
     profile = profile.rename(columns=rename_map)
+
+    # Keep a local copy for backwards compatibility (e.g. explainability call)
+    eval_target_df = raw_info[0]['raw_target'].tail(len(fed_labels[0])).copy()
+    eval_target_df['cluster'] = fed_labels[0]
 
     # 8. Communication Cost (MB)
     comm_cost_mb = 0.0
@@ -536,11 +562,14 @@ def execute_federated_training(raw_df, params, log_callback=None):
     # 9. Formal Privacy Accounting (RDP)
     sigma = params.get('sigma', 0.0)
     if sigma > 0:
-        sample_rate = batch_size / sum(counts)
+        # Each record lives in exactly one client; its subsampling rate is batch/|D_client|.
+        per_client_q = [batch_size / max(1, n) for n in counts]
+        worst_q = max(per_client_q)                 # worst-case record
+        steps_per_client = total_steps // max(1, len(counts))
         accountant = RDPAccountant(
             noise_multiplier=sigma,
-            sample_rate=sample_rate,
-            num_steps=total_steps
+            sample_rate=worst_q,
+            num_steps=steps_per_client
         )
         formal_epsilon = accountant.get_epsilon(delta=1e-5)
     else:
