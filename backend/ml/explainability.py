@@ -36,7 +36,7 @@ def compute_cluster_explainability(df, labels, feature_cols=None):
     # Check if we have valid classes to classify
     unique_classes = np.unique(y)
     if len(unique_classes) > 1 and len(X) >= len(unique_classes):
-        clf = RandomForestClassifier(n_estimators=50, random_state=42, n_init='auto' if hasattr(RandomForestClassifier, 'n_init') else None)
+        clf = RandomForestClassifier(n_estimators=50, random_state=42)
         clf.fit(X, y)
         importances = clf.feature_importances_
     else:
