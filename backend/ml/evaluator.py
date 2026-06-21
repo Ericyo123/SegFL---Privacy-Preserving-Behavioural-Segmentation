@@ -240,14 +240,19 @@ def generalization_test(raw_df, params, execute_fn, log_callback=None):
         log_callback("Evaluating hold-out tenant on test set...")
         
     adapter.eval()
-    holdout_ts_dl = ev_dls[holdout_idx]['test']
+    from sklearn.preprocessing import StandardScaler
+    local_df = holdout_info['raw_target']
+    active_feats = holdout_info['mask']
+    feats_raw = StandardScaler().fit_transform(local_df[active_feats].values)
+    
     lats = []
     with torch.no_grad():
-        for b in holdout_ts_dl:
-            x = b[0].to(device)
-            a_out, _ = adapter(x)
-            _, lat = glob_m(a_out)
-            lats.append(lat.cpu().numpy())
+        # Predict in chunks to save GPU memory
+        for chunk in np.array_split(feats_raw, max(1, len(feats_raw) // 256)):
+            x_b = torch.FloatTensor(chunk).to(device)
+            a_out_b, _ = adapter(x_b)
+            _, lat_b = glob_m(a_out_b)
+            lats.append(lat_b.cpu().numpy())
             
     latents = np.vstack(lats)
     

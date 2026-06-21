@@ -224,55 +224,125 @@ def execute_federated_training(raw_df, params, log_callback=None):
                 for b in dl:
                     original_x = b[0].to(device)
                     opt.zero_grad()
+                    sigma_val = params.get('sigma', 0.0)
 
-                    if mode in ['tal', 'fedprox', 'scaffold', 'moon', 'local']:
-                        a_out, a_rec = (adapters[t_idx] if mode != 'local' else loc_a)(original_x)
-                        g_rec, _ = loc_m(a_out)
-                        loss = F.mse_loss(a_rec, original_x) + F.mse_loss(g_rec, a_out)
-                    elif mode == 'cent':
-                        pad_t = glob_in - original_x.shape[1]
-                        x = torch.cat([original_x, torch.zeros(original_x.shape[0], pad_t).to(device)], dim=1) if pad_t > 0 else original_x
-                        g_rec, _ = loc_m(x)
-                        loss = F.mse_loss(g_rec, x)
-                    else:  # intersect
-                        x = original_x[:, :glob_in]
-                        g_rec, _ = loc_m(x)
-                        loss = F.mse_loss(g_rec, x)
+                    if sigma_val > 0.0:
+                        # --- TRUE DP-SGD: Per-sample gradient clipping & noise addition ---
+                        accum_grads = {name: torch.zeros_like(p.data) for name, p in loc_m.named_parameters()}
+                        if adapters:
+                            active_adapter = adapters[t_idx] if mode != 'local' else loc_a
+                            accum_grads_a = {name: torch.zeros_like(p.data) for name, p in active_adapter.named_parameters()}
 
-                    # FedProx Proximal Regularisation (Li et al., 2020)
-                    if fedprox_mu > 0 and mode != 'local':
-                        proximal_term = 0.0
-                        for w, w_t in zip(loc_m.parameters(), glob_m.parameters()):
-                            proximal_term += torch.sum((w - w_t) ** 2)
-                        loss += (fedprox_mu / 2) * proximal_term
+                        batch_loss = 0.0
+                        for i in range(original_x.size(0)):
+                            x_i = original_x[i:i+1]
+                            opt.zero_grad()
 
-                    # MOON Model-Contrastive loss
-                    if mode == 'moon' and prev_loc_m is not None:
-                        _, z = loc_m(a_out)
-                        with torch.no_grad():
-                            _, z_glob = glob_m_fixed(a_out)
-                            _, z_prev = prev_loc_m(a_out)
-                        
-                        cos_sim = nn.CosineSimilarity(dim=-1)
-                        sim_glob = cos_sim(z, z_glob) / 0.5
-                        sim_prev = cos_sim(z, z_prev) / 0.5
-                        
-                        logits = torch.stack([sim_glob, sim_prev], dim=1)
-                        loss_con = -sim_glob + torch.logsumexp(logits, dim=1)
-                        loss += 0.1 * loss_con.mean()
+                            if mode in ['tal', 'fedprox', 'scaffold', 'moon', 'local']:
+                                a_out_i, a_rec_i = (adapters[t_idx] if mode != 'local' else loc_a)(x_i)
+                                g_rec_i, _ = loc_m(a_out_i)
+                                loss_i = F.mse_loss(a_rec_i, x_i) + F.mse_loss(g_rec_i, a_out_i)
+                            elif mode == 'cent':
+                                pad_t = glob_in - x_i.shape[1]
+                                x_pad = torch.cat([x_i, torch.zeros(x_i.shape[0], pad_t).to(device)], dim=1) if pad_t > 0 else x_i
+                                g_rec_i, _ = loc_m(x_pad)
+                                loss_i = F.mse_loss(g_rec_i, x_pad)
+                            else:  # intersect
+                                x_int = x_i[:, :glob_in]
+                                g_rec_i, _ = loc_m(x_int)
+                                loss_i = F.mse_loss(g_rec_i, x_int)
 
-                    loss.backward()
-                    epoch_losses.append(loss.item())
+                            if fedprox_mu > 0 and mode != 'local':
+                                proximal_term = 0.0
+                                for w, w_t in zip(loc_m.parameters(), glob_m.parameters()):
+                                    proximal_term += torch.sum((w - w_t) ** 2)
+                                loss_i += (fedprox_mu / 2) * proximal_term
 
-                    # Differential Privacy (DP-SGD Noise Injection)
-                    if params.get('sigma', 0.0) > 0.0:
-                        torch.nn.utils.clip_grad_norm_(params_list, 1.0)
-                        for p in params_list:
-                            if p.grad is not None:
-                                noise = torch.randn_like(p.grad) * (params['sigma'] * 1.0) / original_x.shape[0]
-                                p.grad += noise
-                    
-                    # SCAFFOLD client-side control variate correction
+                            if mode == 'moon' and prev_loc_m is not None:
+                                _, z_i = loc_m(a_out_i)
+                                with torch.no_grad():
+                                    _, z_glob_i = glob_m_fixed(a_out_i)
+                                    _, z_prev_i = prev_loc_m(a_out_i)
+                                cos_sim = nn.CosineSimilarity(dim=-1)
+                                sim_glob = cos_sim(z_i, z_glob_i) / 0.5
+                                sim_prev = cos_sim(z_i, z_prev_i) / 0.5
+                                logits = torch.stack([sim_glob, sim_prev], dim=1)
+                                loss_con = -sim_glob + torch.logsumexp(logits, dim=1)
+                                loss_i += 0.1 * loss_con.mean()
+
+                            loss_i.backward()
+                            batch_loss += loss_i.item()
+
+                            # Compute per-sample gradient norm
+                            grad_norm = 0.0
+                            for p in params_list:
+                                if p.grad is not None:
+                                    grad_norm += p.grad.data.norm(2).item() ** 2
+                            grad_norm = grad_norm ** 0.5
+
+                            clip_coef = min(1.0, 1.0 / (grad_norm + 1e-6))
+
+                            for name, p in loc_m.named_parameters():
+                                if p.grad is not None:
+                                    accum_grads[name] += p.grad.data * clip_coef
+                            if adapters:
+                                for name, p in active_adapter.named_parameters():
+                                    if p.grad is not None:
+                                        accum_grads_a[name] += p.grad.data * clip_coef
+
+                        # Set grad to accumulated clipped gradients and add noise
+                        opt.zero_grad()
+                        for name, p in loc_m.named_parameters():
+                            p.grad = (accum_grads[name] / original_x.size(0)).clone()
+                            noise = torch.randn_like(p.grad) * (sigma_val * 1.0) / original_x.size(0)
+                            p.grad.add_(noise)
+
+                        if adapters:
+                            for name, p in active_adapter.named_parameters():
+                                p.grad = (accum_grads_a[name] / original_x.size(0)).clone()
+                                noise = torch.randn_like(p.grad) * (sigma_val * 1.0) / original_x.size(0)
+                                p.grad.add_(noise)
+
+                        epoch_losses.append(batch_loss / original_x.size(0))
+
+                    else:
+                        # --- STANDARD UPDATE: Fast Batch Gradient (No DP) ---
+                        if mode in ['tal', 'fedprox', 'scaffold', 'moon', 'local']:
+                            a_out, a_rec = (adapters[t_idx] if mode != 'local' else loc_a)(original_x)
+                            g_rec, _ = loc_m(a_out)
+                            loss = F.mse_loss(a_rec, original_x) + F.mse_loss(g_rec, a_out)
+                        elif mode == 'cent':
+                            pad_t = glob_in - original_x.shape[1]
+                            x = torch.cat([original_x, torch.zeros(original_x.shape[0], pad_t).to(device)], dim=1) if pad_t > 0 else original_x
+                            g_rec, _ = loc_m(x)
+                            loss = F.mse_loss(g_rec, x)
+                        else:  # intersect
+                            x = original_x[:, :glob_in]
+                            g_rec, _ = loc_m(x)
+                            loss = F.mse_loss(g_rec, x)
+
+                        if fedprox_mu > 0 and mode != 'local':
+                            proximal_term = 0.0
+                            for w, w_t in zip(loc_m.parameters(), glob_m.parameters()):
+                                proximal_term += torch.sum((w - w_t) ** 2)
+                            loss += (fedprox_mu / 2) * proximal_term
+
+                        if mode == 'moon' and prev_loc_m is not None:
+                            _, z = loc_m(a_out)
+                            with torch.no_grad():
+                                _, z_glob = glob_m_fixed(a_out)
+                                _, z_prev = prev_loc_m(a_out)
+                            cos_sim = nn.CosineSimilarity(dim=-1)
+                            sim_glob = cos_sim(z, z_glob) / 0.5
+                            sim_prev = cos_sim(z, z_prev) / 0.5
+                            logits = torch.stack([sim_glob, sim_prev], dim=1)
+                            loss_con = -sim_glob + torch.logsumexp(logits, dim=1)
+                            loss += 0.1 * loss_con.mean()
+
+                        loss.backward()
+                        epoch_losses.append(loss.item())
+
+                    # SCAFFOLD control variate correction
                     if mode == 'scaffold':
                         with torch.no_grad():
                             for name, p in loc_m.named_parameters():

@@ -217,7 +217,8 @@ if btn_run:
             'g_epochs': g_epochs,
             'l_epochs': l_epochs,
             'n_clusters': n_clusters,
-            'clustering_method': clustering_method
+            'clustering_method': clustering_method,
+            'run_seed': dynamic_seed
         }
         
         add_log("Loading dataset into memory...")
@@ -352,9 +353,18 @@ if btn_run:
                 log_callback=add_log
             )
         
+        # ── 6.5. COMPUTE EXPLAINABILITY ──
+        add_log("Computing post-hoc surrogate explainability and feature attributions...")
+        from backend.ml.explainability import compute_cluster_explainability
+        importance_df, enrichment_scores = compute_cluster_explainability(
+            results['clustered_data'], results['labels']
+        )
+        
         add_log("Full Research Cycle Complete. Rendering Dashboard...")
         
         # Save results globally
+        st.session_state.importance_df = importance_df
+        st.session_state.enrichment_scores = enrichment_scores
         st.session_state.results = results
         st.session_state.base_df = base_df
         st.session_state.abl_df = abl_df
@@ -377,7 +387,9 @@ if btn_run:
             'stability_results': stability_results,
             'stat_test_results': stat_test_results,
             'scal_results': scal_results,
-            'gen_results': gen_results
+            'gen_results': gen_results,
+            'importance_df': importance_df,
+            'enrichment_scores': enrichment_scores
         }
         
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
@@ -435,6 +447,10 @@ if st.session_state.get('is_run', False):
     gen_results = st.session_state.get('gen_results', None)
     if scal_results is not None:
         tab_list.append("Scalability & Generalization")
+        
+    importance_df = st.session_state.get('importance_df', None)
+    if importance_df is not None and not importance_df.empty:
+        tab_list.append("Explainability & Interpretability")
     
     tabs = st.tabs(tab_list)
     
@@ -783,4 +799,58 @@ if st.session_state.get('is_run', False):
                 A local Tenant Adapter Layer (TAL) is then trained for the hold-out tenant for a few local epochs to project its raw features into the shared latent space, while keeping the global model weights **frozen**. 
                 The Silhouette Score of **{gen_results['holdout_silhouette']:.3f}** proves that the global model successfully extracts generalizable user behavioral structures that can adapt to new, unseen organizations with zero-shot federated training.
                 """)
+                
+    # ── TAB 9: Explainability & Interpretability (conditional) ──
+    if "Explainability & Interpretability" in tab_list:
+        exp_tab_idx = tab_list.index("Explainability & Interpretability")
+        with tabs[exp_tab_idx]:
+            st.markdown("#### Global Surrogate Feature Importance")
+            st.caption("Shows which features contribute most to the clustering decisions (determined by training a random forest classifier to predict cluster labels).")
+            
+            importance_df = st.session_state.importance_df
+            enrichment_scores = st.session_state.enrichment_scores
+            
+            col_exp1, col_exp2 = st.columns(2)
+            with col_exp1:
+                fig_imp = px.bar(
+                    importance_df, x='Importance', y='Feature',
+                    orientation='h', template='plotly_white',
+                    title="Global Feature Attributions (Random Forest Surrogate)"
+                )
+                fig_imp.update_traces(marker_color='#1e293b')
+                fig_imp.update_layout(
+                    height=380,
+                    yaxis={'categoryorder':'total ascending'},
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=0, r=0, t=30, b=0)
+                )
+                st.plotly_chart(fig_imp, use_container_width=True)
+                
+            with col_exp2:
+                st.markdown("##### Cluster Profiling & Feature Alignment")
+                st.markdown("""
+                The feature importance chart shows the global relevance of each behavioral attribute. 
+                Below, we look at the localized **Enrichment Scores** for each discovered archetype.
+                These scores measure how many standard deviations the cluster's average behavior deviates from the global average:
+                - **Positive Score (+):** Behavior is higher than the global baseline.
+                - **Negative Score (-):** Behavior is lower than the global baseline.
+                """)
+                
+            st.divider()
+            
+            st.markdown("#### Segment Enrichment Scores (Z-Score Deviation)")
+            st.caption("Attribution scores indicating how much a persona deviates from the dataset mean on each feature.")
+            
+            enrich_rows = []
+            for cid, scores in enrichment_scores.items():
+                persona_name = results['profile'].loc[cid, 'Persona'] if cid in results['profile'].index else f"Cluster {cid}"
+                row = {'Cluster': f"Cluster {cid}", 'Persona': persona_name}
+                for feat, val in scores.items():
+                    row[feat] = f"{val:+.3f} σ"
+                enrich_rows.append(row)
+                
+            enrich_df = pd.DataFrame(enrich_rows)
+            st.dataframe(enrich_df, use_container_width=True, hide_index=True)
+
 

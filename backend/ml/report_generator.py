@@ -362,6 +362,70 @@ def build_pdf_report(data, filename):
                 body_style
             ))
             
+    # --- EXPLAINABILITY & INTERPRETABILITY ---
+    importance_df = data.get('importance_df')
+    enrichment_scores = data.get('enrichment_scores')
+    if isinstance(importance_df, pd.DataFrame) and not importance_df.empty:
+        story.append(Paragraph("8. Explainability & Surrogate Feature Attributions", h1_style))
+        story.append(Paragraph(
+            "To interpret the black-box federated representation space, we train a global surrogate random forest model on the raw behavioral features to predict the final cluster label assignments. "
+            "Additionally, cluster enrichment scores quantify the feature-specific Z-score deviations of each cohort from the global mean (measured in global standard deviations σ).",
+            body_style
+        ))
+        
+        # 1. Feature Importance Table
+        story.append(Paragraph("<b>Surrogate Global Feature Importances</b>", ParagraphStyle('Sub', parent=body_style, fontName='Helvetica-Bold')))
+        headers = [Paragraph("<b>Feature</b>", table_header_style), Paragraph("<b>Surrogate Importance Weight</b>", table_header_style)]
+        table_rows = [headers]
+        for _, row in importance_df.iterrows():
+            row_cells = [
+                Paragraph(str(row['Feature']), table_cell_style),
+                Paragraph(f"{row['Importance']:.4f}", table_cell_style)
+            ]
+            table_rows.append(row_cells)
+            
+        imp_table = Table(table_rows, colWidths=[240, 240])
+        imp_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), primary_color),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, bg_color]),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+        ]))
+        story.append(imp_table)
+        story.append(Spacer(1, 10))
+        
+        # 2. Enrichment Scores Table
+        if enrichment_scores:
+            story.append(Paragraph("<b>Cohort Enrichment Deviations (Z-Scores)</b>", ParagraphStyle('Sub', parent=body_style, fontName='Helvetica-Bold')))
+            
+            sample_cid = list(enrichment_scores.keys())[0]
+            feats_list = list(enrichment_scores[sample_cid].keys())
+            
+            headers = [Paragraph("<b>Cohort</b>", table_header_style)] + [Paragraph(f"<b>{f}</b>", table_header_style) for f in feats_list]
+            table_rows = [headers]
+            for cid, scores in enrichment_scores.items():
+                persona_name = results.get('profile').loc[cid, 'Persona'] if (results and 'profile' in results and cid in results['profile'].index) else f"Cluster {cid}"
+                row_cells = [Paragraph(f"<b>Cluster {cid}</b><br/>{persona_name}", table_cell_style)]
+                for feat in feats_list:
+                    val = scores.get(feat, 0.0)
+                    row_cells.append(Paragraph(f"{val:+.3f} σ", table_cell_style))
+                table_rows.append(row_cells)
+                
+            col_widths = [110] + [370 / len(feats_list)] * len(feats_list)
+            enrich_table = Table(table_rows, colWidths=col_widths)
+            enrich_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), primary_color),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                ('TOPPADDING', (0, 0), (-1, -1), 5),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, bg_color]),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+            ]))
+            story.append(enrich_table)
+            story.append(Spacer(1, 12))
+
     # --- FOOTNOTE/SIGNATURE ---
     story.append(Spacer(1, 15))
     story.append(Paragraph("<i>Report generated automatically by SegFL Analytics.</i>", caption_style))
