@@ -6,7 +6,6 @@ __pycache__/
 # macOS system files
 .DS_Store
 
-
 # Large CSV data files
 backend/data/
 *.csv
