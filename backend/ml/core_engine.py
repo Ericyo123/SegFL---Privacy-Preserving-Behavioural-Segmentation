@@ -18,9 +18,9 @@ from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_har
 import torch.nn as nn
 from backend.ml.processor import prepare_tenant_datasets
 from backend.ml.segmenter import (
-    TAL_Adapter, GlobalBottleneckAE, FederatedKMeans,
-    FederatedGMM, FederatedHDBSCAN,
-    formal_aggregator, RDPAccountant
+    TenantAdapterLayer, GlobalBottleneckAutoencoder, FederatedKMeans,
+    FederatedGaussianMixtureModel, FederatedDensityBasedClustering,
+    formal_aggregator, RenyiDifferentialPrivacyAccountant
 )
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -135,23 +135,47 @@ def execute_federated_training(raw_df, params, log_callback=None):
     counts = [len(dl.dataset) for dl in tr_dls]
     shared_dim = 4
 
+    # Build feature alignments for centralized and intersection baselines
+    common_features = set(raw_info[0]['mask'])
+    for r in raw_info[1:]:
+        common_features &= set(r['mask'])
+    common_features = sorted(list(common_features))
+    
+    intersect_indices = []
+    for r in raw_info:
+        idx = [r['mask'].index(f) for f in common_features]
+        intersect_indices.append(idx)
+        
+    all_known_features = sorted(list(set(f for r in raw_info for f in r['mask'])))
+    
+    canonical_indices = []
+    for r in raw_info:
+        idx = [all_known_features.index(f) for f in r['mask']]
+        canonical_indices.append(idx)
+
+    def to_canonical(x_tenant, t_idx):
+        out = torch.zeros(x_tenant.shape[0], len(all_known_features), device=x_tenant.device)
+        idx = canonical_indices[t_idx]
+        out[:, idx] = x_tenant
+        return out
+
     if mode == 'cent':
-        glob_in = max(r['dim'] for r in raw_info)
+        glob_in = len(all_known_features)
     elif mode == 'intersect':
-        glob_in = min(r['dim'] for r in raw_info)
+        glob_in = len(common_features)
     else:
         glob_in = shared_dim
 
     # 2. Model Initialization
-    glob_m = GlobalBottleneckAE(glob_in, shared_dim).to(device)
+    glob_m = GlobalBottleneckAutoencoder(glob_in, shared_dim).to(device)
     uses_tal = mode in ['tal', 'fedprox', 'scaffold', 'moon', 'local']
-    adapters = [TAL_Adapter(r['dim'], shared_dim).to(device) for r in raw_info] if uses_tal else None
+    adapters = [TenantAdapterLayer(r['dim'], shared_dim).to(device) for r in raw_info] if uses_tal else None
 
     local_tracking = []
     if mode == 'local':
         local_tracking = [
-            (GlobalBottleneckAE(glob_in, shared_dim).to(device),
-             TAL_Adapter(r['dim'], shared_dim).to(device))
+            (GlobalBottleneckAutoencoder(glob_in, shared_dim).to(device),
+             TenantAdapterLayer(r['dim'], shared_dim).to(device))
             for r in raw_info
         ]
 
@@ -192,7 +216,7 @@ def execute_federated_training(raw_df, params, log_callback=None):
         # MOON: Fixed global model copy for similarity computation
         glob_m_fixed = None
         if mode == 'moon':
-            glob_m_fixed = GlobalBottleneckAE(glob_in, shared_dim).to(device)
+            glob_m_fixed = GlobalBottleneckAutoencoder(glob_in, shared_dim).to(device)
             glob_m_fixed.load_state_dict(glob_m.state_dict())
             glob_m_fixed.eval()
             for p in glob_m_fixed.parameters():
@@ -204,7 +228,7 @@ def execute_federated_training(raw_df, params, log_callback=None):
                 loc_m, loc_a = local_tracking[t_idx]
                 params_list = list(loc_m.parameters()) + list(loc_a.parameters())
             else:
-                loc_m = GlobalBottleneckAE(glob_in, shared_dim).to(device)
+                loc_m = GlobalBottleneckAutoencoder(glob_in, shared_dim).to(device)
                 loc_m.load_state_dict(glob_m.state_dict())
                 params_list = list(loc_m.parameters())
                 if adapters:
@@ -227,6 +251,15 @@ def execute_federated_training(raw_df, params, log_callback=None):
                     original_x = b[0].to(device)
                     opt.zero_grad()
                     sigma_val = params.get('sigma', 0.0)
+
+                    # Pre-align features for centralized/intersection baselines
+                    if mode == 'cent':
+                        original_x_aligned = to_canonical(original_x, t_idx)
+                    elif mode == 'intersect':
+                        idx_tensor = torch.tensor(intersect_indices[t_idx], device=device)
+                        original_x_aligned = original_x[:, idx_tensor]
+                    else:
+                        original_x_aligned = original_x
 
                     if sigma_val > 0.0:
                         # --- TRUE DP-SGD: Vectorized Per-Sample Gradient Clipping & Noise Addition (35x speedup) ---
@@ -251,15 +284,9 @@ def execute_federated_training(raw_df, params, log_callback=None):
                                 a_out, a_rec = tf.functional_call(active_adapter, (p_a, buffers_a), (x_i_2d,))
                                 g_rec, _ = tf.functional_call(loc_m, (p_m, buffers_m), (a_out,))
                                 loss = torch.mean((a_rec - x_i_2d) ** 2) + torch.mean((g_rec - a_out) ** 2)
-                            elif mode == 'cent':
-                                pad_t = glob_in - x_i_2d.shape[1]
-                                x_pad = torch.cat([x_i_2d, torch.zeros(x_i_2d.shape[0], pad_t).to(device)], dim=1) if pad_t > 0 else x_i_2d
-                                g_rec, _ = tf.functional_call(loc_m, (p_m, buffers_m), (x_pad,))
-                                loss = torch.mean((g_rec - x_pad) ** 2)
-                            else:  # intersect
-                                x_int = x_i_2d[:, :glob_in]
-                                g_rec, _ = tf.functional_call(loc_m, (p_m, buffers_m), (x_int,))
-                                loss = torch.mean((g_rec - x_int) ** 2)
+                            else:  # cent or intersect baselines
+                                g_rec, _ = tf.functional_call(loc_m, (p_m, buffers_m), (x_i_2d,))
+                                loss = torch.mean((g_rec - x_i_2d) ** 2)
 
                             if fedprox_mu > 0 and mode != 'local':
                                 proximal_term = 0.0
@@ -285,16 +312,16 @@ def execute_federated_training(raw_df, params, log_callback=None):
                         grad_fn = tf.grad(single_loss_fn, argnums=0)
                         per_sample_grads_fn = tf.vmap(grad_fn, in_dims=(None, 0), randomness='different')
                         
-                        # Run vectorized gradient extraction
-                        per_sample_grads = per_sample_grads_fn(params_dict, original_x)
+                        # Run vectorized gradient extraction on pre-aligned data
+                        per_sample_grads = per_sample_grads_fn(params_dict, original_x_aligned)
                         
                         # Compute per-sample gradient norms
-                        sq_norms = torch.zeros(original_x.size(0), device=device)
+                        sq_norms = torch.zeros(original_x_aligned.size(0), device=device)
                         for name, grads in per_sample_grads['model'].items():
-                            sq_norms += grads.view(original_x.size(0), -1).pow(2).sum(dim=1)
+                            sq_norms += grads.view(original_x_aligned.size(0), -1).pow(2).sum(dim=1)
                         if 'adapter' in per_sample_grads:
                             for name, grads in per_sample_grads['adapter'].items():
-                                sq_norms += grads.view(original_x.size(0), -1).pow(2).sum(dim=1)
+                                sq_norms += grads.view(original_x_aligned.size(0), -1).pow(2).sum(dim=1)
                                 
                         grad_norms = sq_norms.sqrt()
                         # Clip coefficient: min(1.0, max_grad_norm / (grad_norms + 1e-6))
@@ -307,8 +334,8 @@ def execute_federated_training(raw_df, params, log_callback=None):
                             dims_to_add = len(grads.shape) - 1
                             coefs_expanded = clip_coefs.view(-1, *(1,) * dims_to_add)
                             
-                            p.grad = ((grads * coefs_expanded).sum(dim=0) / original_x.size(0)).clone()
-                            noise = torch.randn_like(p.grad) * (sigma_val * max_grad_norm) / original_x.size(0)
+                            p.grad = ((grads * coefs_expanded).sum(dim=0) / original_x_aligned.size(0)).clone()
+                            noise = torch.randn_like(p.grad) * (sigma_val * max_grad_norm) / original_x_aligned.size(0)
                             p.grad.add_(noise)
                             
                         if adapters:
@@ -317,8 +344,8 @@ def execute_federated_training(raw_df, params, log_callback=None):
                                 dims_to_add = len(grads.shape) - 1
                                 coefs_expanded = clip_coefs.view(-1, *(1,) * dims_to_add)
                                 
-                                p.grad = ((grads * coefs_expanded).sum(dim=0) / original_x.size(0)).clone()
-                                noise = torch.randn_like(p.grad) * (sigma_val * max_grad_norm) / original_x.size(0)
+                                p.grad = ((grads * coefs_expanded).sum(dim=0) / original_x_aligned.size(0)).clone()
+                                noise = torch.randn_like(p.grad) * (sigma_val * max_grad_norm) / original_x_aligned.size(0)
                                 p.grad.add_(noise)
                                 
                         # Average batch loss computation for tracking metrics
@@ -327,15 +354,9 @@ def execute_federated_training(raw_df, params, log_callback=None):
                                 a_out, a_rec = active_adapter(original_x)
                                 g_rec, _ = loc_m(a_out)
                                 loss_val = F.mse_loss(a_rec, original_x) + F.mse_loss(g_rec, a_out)
-                            elif mode == 'cent':
-                                pad_t = glob_in - original_x.shape[1]
-                                x_pad = torch.cat([original_x, torch.zeros(original_x.shape[0], pad_t).to(device)], dim=1) if pad_t > 0 else original_x
-                                g_rec, _ = loc_m(x_pad)
-                                loss_val = F.mse_loss(g_rec, x_pad)
                             else:
-                                x_int = original_x[:, :glob_in]
-                                g_rec, _ = loc_m(x_int)
-                                loss_val = F.mse_loss(g_rec, x_int)
+                                g_rec, _ = loc_m(original_x_aligned)
+                                loss_val = F.mse_loss(g_rec, original_x_aligned)
                             epoch_losses.append(loss_val.item())
 
                     else:
@@ -344,15 +365,9 @@ def execute_federated_training(raw_df, params, log_callback=None):
                             a_out, a_rec = (adapters[t_idx] if mode != 'local' else loc_a)(original_x)
                             g_rec, _ = loc_m(a_out)
                             loss = F.mse_loss(a_rec, original_x) + F.mse_loss(g_rec, a_out)
-                        elif mode == 'cent':
-                            pad_t = glob_in - original_x.shape[1]
-                            x = torch.cat([original_x, torch.zeros(original_x.shape[0], pad_t).to(device)], dim=1) if pad_t > 0 else original_x
-                            g_rec, _ = loc_m(x)
-                            loss = F.mse_loss(g_rec, x)
-                        else:  # intersect
-                            x = original_x[:, :glob_in]
-                            g_rec, _ = loc_m(x)
-                            loss = F.mse_loss(g_rec, x)
+                        else:  # cent or intersect baselines
+                            g_rec, _ = loc_m(original_x_aligned)
+                            loss = F.mse_loss(g_rec, original_x_aligned)
 
                         if fedprox_mu > 0 and mode != 'local':
                             proximal_term = 0.0
@@ -375,7 +390,7 @@ def execute_federated_training(raw_df, params, log_callback=None):
                         loss.backward()
                         epoch_losses.append(loss.item())
 
-                    # SCAFFOLD control variate correction
+                    # # SCAFFOLD control variate correction
                     if mode == 'scaffold':
                         with torch.no_grad():
                             for name, p in loc_m.named_parameters():
@@ -417,7 +432,7 @@ def execute_federated_training(raw_df, params, log_callback=None):
 
             # MOON: Save current local model to use as reference in next round
             if mode == 'moon':
-                prev_m = GlobalBottleneckAE(glob_in, shared_dim).to(device)
+                prev_m = GlobalBottleneckAutoencoder(glob_in, shared_dim).to(device)
                 prev_m.load_state_dict(loc_m.state_dict())
                 prev_m.eval()
                 for p in prev_m.parameters():
@@ -446,7 +461,7 @@ def execute_federated_training(raw_df, params, log_callback=None):
     if log_callback:
         log_callback(f"Evaluating latent geometries...")
 
-    def eval_set(model, test_dl, adapter=None, pad_dim=0, is_intersect=False):
+    def eval_set(model, test_dl, t_idx, adapter=None):
         model.eval()
         if adapter:
             adapter.eval()
@@ -456,10 +471,11 @@ def execute_federated_training(raw_df, params, log_callback=None):
                 x = b[0].to(device)
                 if adapter:
                     x, _ = adapter(x)
-                elif is_intersect:
-                    x = x[:, :pad_dim]
-                elif pad_dim > 0:
-                    x = torch.cat([x, torch.zeros(x.shape[0], pad_dim).to(device)], dim=1)
+                elif mode == 'cent':
+                    x = to_canonical(x, t_idx)
+                elif mode == 'intersect':
+                    idx_tensor = torch.tensor(intersect_indices[t_idx], device=device)
+                    x = x[:, idx_tensor]
                 _, lat = model(x)
                 lats.append(lat.cpu().numpy())
         return np.vstack(lats)
@@ -467,23 +483,21 @@ def execute_federated_training(raw_df, params, log_callback=None):
     lats = []
     for i in range(len(tr_dls)):
         t_dl = ev_dls[i]['test']
-        if mode == 'cent':
-            lats.append(eval_set(glob_m, t_dl, pad_dim=glob_in - raw_info[i]['dim']))
-        elif mode == 'intersect':
-            lats.append(eval_set(glob_m, t_dl, pad_dim=glob_in, is_intersect=True))
-        elif mode == 'local':
-            lats.append(eval_set(local_tracking[i][0], t_dl, adapter=local_tracking[i][1]))
-        else:  # tal, fedprox, scaffold, moon
-            lats.append(eval_set(glob_m, t_dl, adapter=adapters[i]))
+        if mode == 'local':
+            lats.append(eval_set(local_tracking[i][0], t_dl, i, adapter=local_tracking[i][1]))
+        elif mode in ['tal', 'fedprox', 'scaffold', 'moon']:
+            lats.append(eval_set(glob_m, t_dl, i, adapter=adapters[i]))
+        else:  # cent, intersect
+            lats.append(eval_set(glob_m, t_dl, i))
 
     # NOTE: No post-hoc latent manipulation. Results emerge purely from learning.
 
     # 5. Federated Clustering
     clust_method = params.get('clustering_method', 'kmeans')
     if clust_method == 'gmm':
-        fed_clust = FederatedGMM(n_components=params.get('n_clusters', 5), random_state=run_seed or 42)
+        fed_clust = FederatedGaussianMixtureModel(n_components=params.get('n_clusters', 5), random_state=run_seed or 42)
     elif clust_method == 'hdbscan':
-        fed_clust = FederatedHDBSCAN(min_cluster_size=params.get('min_cluster_size', 5), random_state=run_seed or 42)
+        fed_clust = FederatedDensityBasedClustering(min_cluster_size=params.get('min_cluster_size', 5), random_state=run_seed or 42)
     else:
         fed_clust = FederatedKMeans(n_clusters=params.get('n_clusters', 5), random_state=run_seed or 42)
         
@@ -508,8 +522,7 @@ def execute_federated_training(raw_df, params, log_callback=None):
     global_counts = {c: 0 for c in unique_labels}
     
     for i, labels_i in enumerate(fed_labels):
-        client_df = raw_info[i]['raw_target'].copy()
-        client_df = client_df.tail(len(labels_i))
+        client_df = raw_info[i]['raw_target'].iloc[raw_info[i]['test_idx']].copy()
         client_df['cluster'] = labels_i
         
         for c in unique_labels:
@@ -544,7 +557,7 @@ def execute_federated_training(raw_df, params, log_callback=None):
     profile = profile.rename(columns=rename_map)
 
     # Keep a local copy for backwards compatibility (e.g. explainability call)
-    eval_target_df = raw_info[0]['raw_target'].tail(len(fed_labels[0])).copy()
+    eval_target_df = raw_info[0]['raw_target'].iloc[raw_info[0]['test_idx']].copy()
     eval_target_df['cluster'] = fed_labels[0]
 
     # 8. Communication Cost (MB)
@@ -566,12 +579,17 @@ def execute_federated_training(raw_df, params, log_callback=None):
         per_client_q = [batch_size / max(1, n) for n in counts]
         worst_q = max(per_client_q)                 # worst-case record
         steps_per_client = total_steps // max(1, len(counts))
-        accountant = RDPAccountant(
+        accountant = RenyiDifferentialPrivacyAccountant(
             noise_multiplier=sigma,
             sample_rate=worst_q,
             num_steps=steps_per_client
         )
         formal_epsilon = accountant.get_epsilon(delta=1e-5)
+        # Compose the clustering-stage Laplace noise
+        # Sensitivity of count is 1, sum is 1.0. Epsilon of Laplace mechanism = 1 / sigma.
+        # We perform one federated clustering step.
+        eps_cluster = 1.0 / sigma
+        formal_epsilon = formal_epsilon + eps_cluster
     else:
         formal_epsilon = float('inf')
 

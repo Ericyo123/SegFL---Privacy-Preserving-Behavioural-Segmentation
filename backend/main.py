@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from typing import List, Optional
 from ml.processor import process_csv, prepare_tenant_datasets
 from ml.segmenter import (
-    TAL_Adapter, GlobalBottleneckAE, FederatedKMeans, 
+    TenantAdapterLayer, GlobalBottleneckAutoencoder, FederatedKMeans, 
     formal_aggregator, compute_epsilon
 )
 from sklearn.metrics import silhouette_score, davies_bouldin_score
@@ -52,15 +52,15 @@ def run_training_task(job_id: str, file_path: str, nrows: int, g_epochs: int, l_
         
         # Training logic
         jobs[job_id]["status"] = "training_ml"
-        glob_m = GlobalBottleneckAE(glob_in, shared_dim).to(device)
-        adapters = [TAL_Adapter(r['dim'], shared_dim).to(device) for r in raw_info]
+        glob_m = GlobalBottleneckAutoencoder(glob_in, shared_dim).to(device)
+        adapters = [TenantAdapterLayer(r['dim'], shared_dim).to(device) for r in raw_info]
         
         lr = 0.005
         
         for g_rnd in range(g_epochs):
             st_collection = []
             for t_idx, dl in enumerate(tr_dls):
-                loc_m = GlobalBottleneckAE(glob_in, shared_dim).to(device)
+                loc_m = GlobalBottleneckAutoencoder(glob_in, shared_dim).to(device)
                 loc_m.load_state_dict(glob_m.state_dict())
                 params = list(loc_m.parameters()) + list(adapters[t_idx].parameters())
                 opt = optim.Adam(params, lr=lr)

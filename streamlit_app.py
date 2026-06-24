@@ -488,7 +488,7 @@ if st.session_state.get('is_run', False):
     # ── TAB 1: Convergence ──
     with tabs[0]:
         st.markdown("#### TAL-FL Global Convergence (Loss)")
-        st.caption("Reconstruction loss of the GlobalBottleneckAE across federated training rounds.")
+        st.caption("Reconstruction loss of the GlobalBottleneckAutoencoder across federated training rounds.")
         loss_df = pd.DataFrame({
             'Global Round': range(1, len(results['loss_history']) + 1),
             'MSE Loss': results['loss_history']

@@ -7,7 +7,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score, davies_bouldin_score
 
-class TAL_Adapter(nn.Module):
+class TenantAdapterLayer(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
         # Deeper hierarchical feature extraction for complex alignment
@@ -34,7 +34,7 @@ class TAL_Adapter(nn.Module):
     def forward(self, x): 
         return self.enc(x), self.dec(self.enc(x))
 
-class GlobalBottleneckAE(nn.Module):
+class GlobalBottleneckAutoencoder(nn.Module):
     def __init__(self, in_dim, bottle_dim):
         super().__init__()
         # Deeper hierarchical representations for reconstruction
@@ -153,7 +153,7 @@ def formal_aggregator(states, counts):
     return global_s
 
 def compute_epsilon(sigma, epochs, dataset_size, batch_size=256):
-    """Legacy epsilon approximation. Use RDPAccountant for formal guarantees."""
+    """Legacy epsilon approximation. Use RenyiDifferentialPrivacyAccountant for formal guarantees."""
     if sigma == 0: return float('inf')
     delta = 1e-5
     q = batch_size / dataset_size
@@ -161,7 +161,7 @@ def compute_epsilon(sigma, epochs, dataset_size, batch_size=256):
     epsilon_bound = (q * np.sqrt(2 * steps * np.log(1/delta))) / sigma
     return epsilon_bound
 
-class RDPAccountant:
+class RenyiDifferentialPrivacyAccountant:
     """
     Rényi Differential Privacy Accountant for DP-SGD.
     
@@ -250,7 +250,7 @@ class RDPAccountant:
         return max(0.0, best_eps)
 
 
-class FederatedGMM:
+class FederatedGaussianMixtureModel:
     """
     Federated Gaussian Mixture Model clustering using expectation maximization (EM)
     over decentralized clients, assuming diagonal covariance.
@@ -379,7 +379,7 @@ class FederatedGMM:
         return final_labels
 
 
-class FederatedHDBSCAN:
+class FederatedDensityBasedClustering:
     """
     Federated Density-Based clustering (HDBSCAN) using local centroid summarization.
     """

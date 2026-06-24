@@ -186,8 +186,11 @@ def prepare_tenant_datasets(df, batch_size=256, run_seed=None, feature_masks=Non
             
         feats = StandardScaler().fit_transform(local_df[active_features].values)
 
-        X_tmp, X_ts = train_test_split(feats, test_size=0.10, random_state=run_seed)
-        X_tr, X_val = train_test_split(X_tmp, test_size=0.1111, random_state=run_seed)
+        idx_all = np.arange(len(local_df))
+        idx_tmp, idx_ts = train_test_split(idx_all, test_size=0.10, random_state=run_seed)
+        idx_tr, idx_val = train_test_split(idx_tmp, test_size=0.1111, random_state=run_seed)
+
+        X_tr, X_val, X_ts = feats[idx_tr], feats[idx_val], feats[idx_ts]
 
         train_dl.append(DataLoader(TensorDataset(torch.FloatTensor(X_tr)), batch_size=batch_size, shuffle=True))
         eval_dl.append({
@@ -197,7 +200,8 @@ def prepare_tenant_datasets(df, batch_size=256, run_seed=None, feature_masks=Non
         raw.append({
             'dim': len(active_features), 
             'mask': active_features, 
-            'raw_target': local_df
+            'raw_target': local_df,
+            'test_idx': idx_ts
         })
 
     return train_dl, eval_dl, raw

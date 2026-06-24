@@ -184,7 +184,7 @@ def generalization_test(raw_df, params, execute_fn, log_callback=None):
     import torch.optim as optim
     import torch.nn.functional as F
     from backend.ml.processor import prepare_tenant_datasets
-    from backend.ml.segmenter import TAL_Adapter, GlobalBottleneckAE
+    from backend.ml.segmenter import TenantAdapterLayer, GlobalBottleneckAutoencoder
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -208,7 +208,7 @@ def generalization_test(raw_df, params, execute_fn, log_callback=None):
     glob_in_model = 4 if uses_tal else max(r['dim'] for r in raw_info[:-1])
     shared_dim = 4
     
-    glob_m = GlobalBottleneckAE(glob_in_model, shared_dim).to(device)
+    glob_m = GlobalBottleneckAutoencoder(glob_in_model, shared_dim).to(device)
     glob_m.load_state_dict(res_train['model_state_dict'])
     glob_m.eval()
     for p in glob_m.parameters():
@@ -221,7 +221,7 @@ def generalization_test(raw_df, params, execute_fn, log_callback=None):
     if log_callback:
         log_callback(f"Initializing and training local adapter for hold-out tenant with feature dim {holdout_dim}...")
         
-    adapter = TAL_Adapter(holdout_dim, shared_dim).to(device)
+    adapter = TenantAdapterLayer(holdout_dim, shared_dim).to(device)
     optimizer = optim.AdamW(adapter.parameters(), lr=0.005, weight_decay=1e-4)
     
     holdout_tr_dl = tr_dls[holdout_idx]
